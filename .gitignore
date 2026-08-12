@@ -1,0 +1,28 @@
+# Regenerable artifacts - every one of these is rebuilt by `run_screen.py`
+# or `build_report.py`. Nothing here is a source of truth; ClickHouse is.
+# data/ is no longer part of the pipeline: stages hand off through
+# asset_universe_cache in ClickHouse. It only appears if you pass --data-dir.
+data/*.parquet
+reports/*.html
+logs/
+.daily_job.lock
+
+# Credentials. general_config.json holds the proxy; ClickHouse creds come from
+# CH_URL / CH_USER / CH_PASS env vars (see README). Neither belongs in git.
+exchange_api_fetcher/general_config.json
+tardis_fetcher/tardis_config.json
+.env
+
+# Probe output - regenerate with `python -m exchange_api_fetcher.probe_coverage`
+exchange_api_fetcher/probe_results.csv
+exchange_api_fetcher/coverage.csv
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
+
+# Local docs for ref only
+additional_docs/
