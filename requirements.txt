@@ -1,0 +1,12 @@
+# Pinned to what is running on Bruce as of 2026-08-10.
+# Python 3.10+ (the code uses `X | None` annotations under `from __future__`).
+
+pandas==2.3.2
+numpy==2.2.6
+pyarrow==21.0.0            # parquet in data/
+requests==2.32.5           # venue REST + ClickHouse HTTP
+clickhouse-connect==0.10.0 # ClickHouse inserts (native protocol for DataFrames)
+
+# dashboard only - the pipeline and cron do not need these
+fastapi==0.136.1
+uvicorn==0.46.0

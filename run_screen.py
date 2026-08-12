@@ -1,0 +1,424 @@
+"""End-to-end universe screen. Writes parquet artifacts for the HTML report.
+
+    python run_screen.py [--days 30] [--top 90] [--no-deep]
+
+Stages: specs -> asset keys -> internal mapping -> venue-wide snapshot -> shortlist
+-> deep 30d daily history -> per-asset metrics.
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import logging
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+
+from exchange_api_fetcher.daily import resolve
+from exchange_api_fetcher.fx import FxTable
+from exchange_api_fetcher.screen import build_shortlist, fetch_deep, fetch_snapshot
+from exchange_api_fetcher.specs import fetch_all
+from exchange_api_fetcher.symbology import (derive_asset_keys, map_internal,
+                                            parse_internal_names)
+
+logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(message)s")
+OUT = Path(__file__).parent / "data"
+CH, AUTH = "http://192.168.50.39:8123/", ("vinny", "888")
+
+
+def ch(sql: str) -> pd.DataFrame:
+    r = requests.post(CH, params={"query": sql + " FORMAT TSVWithNames"}, auth=AUTH,
+                      timeout=300)
+    r.raise_for_status()
+    return pd.read_csv(io.StringIO(r.text), sep="\t")
+
+
+def traded_instruments(days: int = 10) -> pd.DataFrame:
+    frames = []
+    for db in ("strat__tk_alex", "strat__hk_alex"):
+        frames.append(ch(f"""
+        WITH nm AS (SELECT symbol_id,
+                     argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
+                    FROM {db}.symbols_record GROUP BY symbol_id)
+        SELECT nm.name AS name, count() AS fills,
+               min(toDate(e.local_nanos)) AS first_day,
+               max(toDate(e.local_nanos)) AS last_day
+        FROM {db}.dop_exec_record e
+        LEFT JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
+        WHERE e.local_nanos >= now() - INTERVAL {days} DAY
+        GROUP BY name"""))
+    t = pd.concat(frames)
+    t = t.groupby("name", as_index=False).agg(fills=("fills", "sum"),
+                                             first_day=("first_day", "min"),
+                                             last_day=("last_day", "max"))
+    return t[t["name"].str.match(r"^[A-Z]{3}-(S|P|IP|F|IF)-")].copy()
+
+
+def find_duplicate_tickers(snap: pd.DataFrame, tol: float = 0.004) -> pd.DataFrame:
+    """Same underlying listed under different tickers = a symbology collision we would
+    otherwise count as two assets with one venue each.
+
+    Detection: two asset_keys of the same class whose median price agrees within `tol`
+    and whose tickers share a >=3-char prefix. Reported, never auto-merged.
+    """
+    a = (snap[(snap["is_excluded"] == 0) & snap["last"].notna()]
+         .groupby(["asset_key", "asset_class"], as_index=False)
+         .agg(px=("last", "median"), vol=("vol24h_usd", "sum"),
+              venues=("venue", "nunique")))
+    hits = []
+    for cls, g in a.groupby("asset_class"):
+        g = g.sort_values("px").reset_index(drop=True)
+        for i in range(len(g)):
+            for j in range(i + 1, len(g)):
+                if g.px[j] > g.px[i] * (1 + tol):
+                    break
+                k1, k2 = g.asset_key[i], g.asset_key[j]
+                pre = len({k1[:3], k2[:3]}) == 1
+                if pre and k1 != k2:
+                    hits.append({"asset_a": k1, "asset_b": k2, "class": cls,
+                                 "px_a": g.px[i], "px_b": g.px[j],
+                                 "diff_bps": (g.px[j] / g.px[i] - 1) * 1e4,
+                                 "vol_a": g.vol[i], "vol_b": g.vol[j],
+                                 "venues_a": g.venues[i], "venues_b": g.venues[j]})
+    return pd.DataFrame(hits).sort_values("diff_bps") if hits else pd.DataFrame()
+
+
+def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
+                  spec: pd.DataFrame) -> pd.DataFrame:
+    """Per-asset level / trend / stability / structure, from the 30d daily history."""
+    d = deep.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    spec = spec.copy()
+    spec["listed_since"] = pd.to_datetime(spec["listed_since"], errors="coerce")
+    spec["mkt"] = np.where(spec["kind"] == "spot", "spot", "perp")
+    key = spec[["venue", "symbol", "mkt", "asset_key", "asset_class", "listed_since",
+                "tick", "maker_fee", "is_excluded"]] \
+        .drop_duplicates(["venue", "symbol", "mkt"])
+    d["mkt"] = np.where(d["market_type"] == "spot", "spot", "perp")
+    d = d.merge(key, on=["venue", "symbol", "mkt"], how="left")
+    d = d[d["is_excluded"] != 1]
+
+    # Spot is measured but kept OUT of the perp aggregates below. The ADV/OI gates
+    # describe the market we quote on; folding spot turnover into them would move
+    # every asset's number and silently invalidate the calibrated thresholds.
+    # Spot arrives as its own columns further down.
+    spot = d[d["mkt"] == "spot"].copy()
+    d = d[d["mkt"] == "perp"]
+
+    # ---- per asset per day, summed across venues -----------------------------
+    ad = d.groupby(["asset_key", "date"], as_index=False).agg(
+        vol_usd=("vol_usd", "sum"),
+        oi_usd=("oi_usd", "sum"),
+        trades=("trades", "sum"),
+        n_venues=("venue", "nunique"),
+        px=("px_close", "median"),
+        px_min=("px_close", "min"), px_max=("px_close", "max"),
+        fund_min=("funding_sum", "min"), fund_max=("funding_sum", "max"),
+        fund_med=("funding_sum", "median"),
+        hl=("px_high", lambda s: np.nan), )
+    # intraday range needs the per-venue rows, recompute properly
+    rng = d.assign(hl_bps=(d["px_high"] - d["px_low"]) / d["px_close"] * 1e4) \
+        .groupby(["asset_key", "date"], as_index=False)["hl_bps"].median()
+    ad = ad.drop(columns=["hl"]).merge(rng, on=["asset_key", "date"], how="left")
+    ad["px_spread_bps"] = (ad["px_max"] / ad["px_min"] - 1) * 1e4
+    ad["fund_spread_bps"] = (ad["fund_max"] - ad["fund_min"]) * 1e4
+
+    def agg(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("date")
+        v = g["vol_usd"].replace(0, np.nan)
+        v7, v30 = v.tail(7).median(), v.median()
+        # --- onset detection: a name that listed mid-window must not be judged on
+        # 30-day persistence. "Live" = a day with >10% of the asset's own recent
+        # median volume; onset = the first such day.
+        thresh = (v7 or v30 or 0) * 0.10
+        live = (g["vol_usd"] >= thresh) & (g["vol_usd"] > 0)
+        live_days = int(live.sum())
+        onset_idx = int(np.argmax(live.values)) if live.any() else len(g)
+        days_since_onset = len(g) - onset_idx
+        post = g.iloc[onset_idx:]
+        # newest-first, zeros dropped: the fast change metrics below index off this
+        vd = g.sort_values("date", ascending=False)["vol_usd"]
+        vd = vd[vd > 0].to_numpy(dtype=float)
+        lv = np.log(v.dropna())
+        slope = np.nan
+        if len(lv) >= 8:
+            x = np.arange(len(lv))
+            slope = np.polyfit(x, lv.values, 1)[0]
+            slope = (np.exp(slope) - 1) * 100          # %/day
+        # same regression over the trailing 7 days only. vd is newest-first, so it is
+        # reversed back to chronological order or the sign comes out backwards.
+        slope7 = np.nan
+        v7 = vd[:7][::-1]
+        if len(v7) >= 4:
+            slope7 = np.polyfit(np.arange(len(v7)), np.log(v7), 1)[0]
+            slope7 = (np.exp(slope7) - 1) * 100
+        return pd.Series({
+            "days": g["date"].nunique(),
+            "vol_usd_med30": v30,
+            "vol_usd_mean30": float(g["vol_usd"].mean()),
+            "vol_usd_med7": v7,
+            # mean/median > ~1.5 means the flow is concentrated in a few days
+            "vol_burstiness": (float(g["vol_usd"].mean()) / v30) if v30 else np.nan,
+            "vol_trend": (v7 / v30) if v30 else np.nan,
+            # vol_trend is a LEVEL ratio, not a change: after a pump the 30d median
+            # lags for weeks, so it stays huge and rising while the asset collapses
+            # (BLESS 2026-08-12 read 38.8 with volume down 10x over six days). These
+            # three can actually fall, so they are what a decay rule should read.
+            "vol_d1": (vd[0] / vd[1]) if len(vd) > 1 and vd[1] > 0 else np.nan,
+            # same weekday a week ago: volume has a big weekday cycle (MU trades 20x
+            # more Mon-Fri than Sat-Sun), so a raw 1d change on a Monday is calendar,
+            # not flow. This comparison cancels it.
+            "vol_dow7": (vd[0] / vd[7]) if len(vd) > 7 and vd[7] > 0 else np.nan,
+            # days since the 14d peak - with vol_off_peak this is the only pair that
+            # says "rolling over" while a pump is still inside every window
+            "vol_peak_age": (int(np.argmax(vd[:14])) if len(vd) else -1),
+            # 7d version of vol_slope_pct_day. The 30d regression stays positive for
+            # weeks after a pump ends (BLESS: +19.6 %/day over 30d while the 7d slope
+            # read -35.6), so the short window is the one that reflects direction.
+            "vol_slope7_pct_day": slope7,
+            "vol_r37": (float(np.median(vd[:3])) / float(np.median(vd[:7]))
+                        if len(vd) >= 7 and np.median(vd[:7]) > 0 else np.nan),
+            "vol_off_peak": (vd[0] / vd[:14].max()
+                             if len(vd) and vd[:14].max() > 0 else np.nan),
+            "vol_slope_pct_day": slope,
+            "vol_logmad": (lv - lv.median()).abs().median() if len(lv) > 3 else np.nan,
+            "days_above_5m": float((g["vol_usd"] >= 5e6).mean()),
+            # persistence measured only over days the asset was actually live
+            "days_above_5m_live": (float((post["vol_usd"] >= 5e6).mean())
+                                   if len(post) else np.nan),
+            "days_since_onset": days_since_onset,
+            "live_days": live_days,
+            "oi_usd_med30": g["oi_usd"].replace(0, np.nan).median(),
+            "oi_usd_mean30": g["oi_usd"].replace(0, np.nan).mean(),
+            "oi_days": int(g["oi_usd"].replace(0, np.nan).notna().sum()),
+            "oi_trend": (g["oi_usd"].tail(7).median()
+                         / g["oi_usd"].median()) if g["oi_usd"].median() else np.nan,
+            "trades_med30": g["trades"].replace(0, np.nan).median(),
+            "n_venues": int(g["n_venues"].max()),
+            "rv_bps_med": g["hl_bps"].median(),
+            "px_spread_bps_med": g["px_spread_bps"].median(),
+            "fund_bps_med": g["fund_med"].median() * 1e4,
+            "fund_spread_bps_med": g["fund_spread_bps"].median(),
+        })
+
+    m = ad.groupby("asset_key").apply(agg, include_groups=False).reset_index()
+
+    # ---- structure from the live snapshot ------------------------------------
+    # perp only: spread/tick/venue-count/OI all describe the derivative market.
+    # Before spot was fetched this filter was implicit; now it has to be explicit
+    # or venues_perp and venue_hhi silently double-count.
+    snap_all = snap
+    snap = snap[snap.get("mkt", "perp") == "perp"] if "mkt" in snap.columns else snap
+    s = snap[snap["is_excluded"] == 0].copy()
+    s["listed_since"] = pd.to_datetime(s["listed_since"], errors="coerce")
+    st = s.groupby("asset_key").agg(
+        spread_bps_min=("spread_bps", "min"),
+        spread_bps_med=("spread_bps", "median"),
+        tick_bps_med=("tick_bps", "median"),
+        venues_perp=("venue", "nunique"),
+        maker_fee_min=("maker_fee", "min"),
+        asset_class=("asset_class", "first"),
+        equity_region=("equity_region", lambda x: next((v for v in x if v), "")),
+        listed_since=("listed_since", "min"),
+        min_notional_max=("min_notional", "max")).reset_index()
+    m = m.merge(st, on="asset_key", how="left")
+    # venue concentration
+    vs = s.groupby(["asset_key", "venue"])["vol24h_usd"].sum().reset_index()
+    tot = vs.groupby("asset_key")["vol24h_usd"].transform("sum")
+    vs["sh"] = vs["vol24h_usd"] / tot.replace(0, np.nan)
+    hhi = vs.groupby("asset_key")["sh"].apply(lambda x: float((x ** 2).sum()))
+    m = m.merge(hhi.rename("venue_hhi"), on="asset_key", how="left")
+    # Bitget publishes no OI HISTORY, so the 30d OI series omits it. Quantify the
+    # understatement from the live snapshot, where Bitget's OI *is* available.
+    oi_live = s.groupby("asset_key")["oi_usd"].sum().rename("oi_usd_live")
+    oi_bgt = (s[s["venue"] == "BGT"].groupby("asset_key")["oi_usd"].sum()
+              .rename("oi_usd_live_bgt"))
+    m = m.merge(oi_live, on="asset_key", how="left").merge(oi_bgt, on="asset_key",
+                                                           how="left")
+    m["oi_usd_live_bgt"] = m["oi_usd_live_bgt"].fillna(0.0)
+    m["oi_bgt_share"] = (m["oi_usd_live_bgt"] / m["oi_usd_live"].replace(0, np.nan))
+    # venues whose OI history we actually have (BGT excluded by construction)
+    oi_venues = (s[s["venue"] != "BGT"].groupby("asset_key")["venue"].nunique()
+                 .rename("oi_venues"))
+    m = m.merge(oi_venues, on="asset_key", how="left")
+    m["oi_venues"] = m["oi_venues"].fillna(0).astype(int)
+    # ---- spot ---------------------------------------------------------------
+    # venues_spot counts LISTED pairs; a listing with no flow is not a hedge. The
+    # _live columns come from the 30d spot history and are the ones to trust.
+    sp = spec[(spec["kind"] == "spot") & (spec["active"] == 1) & (spec["is_excluded"] == 0)]
+    m = m.merge(sp.groupby("asset_key")["venue"].nunique().rename("venues_spot"),
+                on="asset_key", how="left")
+    m["venues_spot"] = m["venues_spot"].fillna(0).astype(int)
+
+    if len(spot):
+        sd = spot.groupby(["asset_key", "date"], as_index=False).agg(
+            vol_usd=("vol_usd", "sum"), n_venues=("venue", "nunique"))
+        sm = sd.groupby("asset_key").agg(
+            spot_vol_usd_med30=("vol_usd", "median"),
+            spot_vol_usd_mean30=("vol_usd", "mean"),
+            spot_days=("date", "nunique"),
+            spot_venues_live=("n_venues", "max")).reset_index()
+        sm["spot_vol_usd_med7"] = (spot.groupby(["asset_key", "date"])["vol_usd"].sum()
+                                   .groupby("asset_key").apply(lambda x: x.tail(7).median())
+                                   .values)
+        m = m.merge(sm, on="asset_key", how="left")
+    for c in ("spot_vol_usd_med30", "spot_vol_usd_mean30", "spot_vol_usd_med7"):
+        if c not in m:
+            m[c] = np.nan
+    for c in ("spot_days", "spot_venues_live"):
+        if c not in m:
+            m[c] = 0
+        m[c] = m[c].fillna(0).astype(int)
+    # perp/spot ratio: a very high number means the derivative floats free of any
+    # deliverable market, which is where hedging gets expensive
+    m["perp_spot_ratio"] = m["vol_usd_med30"] / m["spot_vol_usd_med30"].replace(0, np.nan)
+    m["spot_share"] = (m["spot_vol_usd_med30"]
+                       / (m["spot_vol_usd_med30"].fillna(0) + m["vol_usd_med30"]))
+    m["oi_to_adv"] = m["oi_usd_med30"] / m["vol_usd_med30"]
+    m["age_days"] = (pd.Timestamp.utcnow().tz_localize(None)
+                     - pd.to_datetime(m["listed_since"])).dt.days
+    return m
+
+
+def venue_metrics(deep: pd.DataFrame, snap: pd.DataFrame, spec: pd.DataFrame,
+                  imap: pd.DataFrame) -> pd.DataFrame:
+    """One row per (asset, venue): the per-exchange breakdown behind each asset."""
+    d = deep.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    spec = spec.copy()
+    spec["mkt"] = np.where(spec["kind"] == "spot", "spot", "perp")
+    key = spec[["venue", "symbol", "mkt", "asset_key", "asset_class", "is_excluded"]] \
+        .drop_duplicates(["venue", "symbol", "mkt"])
+    d["mkt"] = np.where(d["market_type"] == "spot", "spot", "perp")
+    d = d.merge(key, on=["venue", "symbol", "mkt"], how="left")
+    d = d[d["is_excluded"] != 1]
+
+    # market_type is part of the key: BIN lists BTCUSDT as both spot and perp, so
+    # (asset, venue, symbol) alone merges the two into one row and loses whichever
+    # sorts last.
+    g = d.groupby(["asset_key", "venue", "symbol", "market_type"], as_index=False).agg(
+        vol_usd_mean30=("vol_usd", "mean"),
+        vol_usd_med30=("vol_usd", "median"),
+        oi_usd_med30=("oi_usd", "median"),
+        oi_days=("oi_usd", lambda x: int(x.notna().sum())),
+        trades_med30=("trades", "median"),
+        fund_bps_med=("funding_sum", lambda x: x.median() * 1e4),
+        fund_iv_h=("funding_interval_h", "median"),
+        px_close=("px_close", "last"),
+        days=("date", "nunique"))
+    g["vol_usd_med7"] = d.sort_values("date").groupby(
+        ["asset_key", "venue", "symbol", "market_type"])["vol_usd"].apply(
+        lambda x: x.tail(7).median()).values
+    g["vol_trend"] = g["vol_usd_med7"] / g["vol_usd_med30"].replace(0, np.nan)
+
+    # live structure per instrument
+    sl = snap[["venue", "symbol", "mkt", "spread_bps", "tick_bps", "oi_usd",
+               "vol24h_usd", "maker_fee", "taker_fee", "min_notional", "listed_since",
+               "quote", "contract_mult"]].rename(columns={"oi_usd": "oi_usd_live"}) \
+        .drop_duplicates(["venue", "symbol", "mkt"])
+    g["mkt"] = np.where(g["market_type"] == "spot", "spot", "perp")
+    g = g.merge(sl, on=["venue", "symbol", "mkt"], how="left")
+    # share is within market type - a spot leg's share of the perp market is not a
+    # meaningful number, and mixing them makes both wrong
+    tot = g.groupby(["asset_key", "mkt"])["vol_usd_mean30"].transform("sum")
+    g["vol_share"] = g["vol_usd_mean30"] / tot.replace(0, np.nan)
+    # do we quote this exact instrument?
+    ours = set(zip(imap["venue"].fillna(""), imap["symbol"].fillna("")))
+    g["we_quote"] = [int((v, s_) in ours) for v, s_ in zip(g["venue"], g["symbol"])]
+    g = g.sort_values(["asset_key", "mkt", "vol_usd_mean30"],
+                      ascending=[True, True, False])
+    return g.drop(columns=["mkt"])          # helper only; market_type is the real column
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--top", type=int, default=90)
+    ap.add_argument("--no-deep", action="store_true")
+    ap.add_argument("--no-spot", action="store_true",
+                    help="skip spot legs (perp-only, the pre-2026-08-10 behaviour)")
+    ap.add_argument("--reuse-deep", action="store_true",
+                    help="load the existing deep_daily.parquet instead of refetching")
+    a = ap.parse_args()
+    OUT.mkdir(exist_ok=True)
+    # UTC, not date.today(): every bar boundary in this pipeline is a true UTC day
+    # (PIPELINE.md 2.1), and the box is America/New_York. A cron firing at 23:20
+    # local is already 03:20 the next UTC day, so a local date silently fetches one
+    # day less than it should.
+    today = datetime.now(timezone.utc).date()
+    end = today - timedelta(days=1)
+    start = end - timedelta(days=a.days - 1)
+
+    print("== 1. instrument specs ==")
+    spec = derive_asset_keys(fetch_all())
+    spec.to_parquet(OUT / "instrument_ref.parquet", index=False)
+    print(f"   {len(spec)} instruments, {spec.active.sum()} active, "
+          f"{spec.is_excluded.sum()} excluded")
+
+    print("== 2. internal symbology mapping ==")
+    trd = traded_instruments()
+    mp = map_internal(parse_internal_names(trd["name"]), spec).merge(trd, on="name")
+    mp.to_parquet(OUT / "internal_map.parquet", index=False)
+    n_ok = (mp.match_rule != "UNMATCHED").sum()
+    print(f"   {n_ok}/{len(mp)} internal instruments mapped; "
+          f"rules={mp.match_rule.value_counts().to_dict()}")
+
+    print("== 3. venue-wide snapshot ==")
+    fx = FxTable(["USDT", "USDC", "USD"], start, today)
+    snap = fetch_snapshot(spec, fx)
+    snap.to_parquet(OUT / "snapshot.parquet", index=False)
+    print(f"   {len(snap)} perp instruments, ${snap.vol24h_usd.sum()/1e9:.1f}B 24h")
+
+    dup = find_duplicate_tickers(snap)
+    dup.to_parquet(OUT / "dup_tickers.parquet", index=False)
+    print(f"   {len(dup)} possible duplicate-ticker pairs")
+
+    traded_assets = set(mp["asset_key"].dropna())
+    sl = build_shortlist(snap, traded_assets, top_n=a.top)
+    sl.to_parquet(OUT / "shortlist.parquet", index=False)
+    print(f"   shortlist {len(sl)} assets "
+          f"({int(sl.traded.sum())} traded / {int((~sl.traded).sum())} candidates)")
+
+    if a.no_deep:
+        return
+    if a.reuse_deep and (OUT / "deep_daily.parquet").exists():
+        deep = pd.read_parquet(OUT / "deep_daily.parquet")
+        # the spec fixes only REMOVE instruments, so the cached pull is a superset
+        mk = np.where(snap["kind"] == "spot", "spot", "perp")
+        live = set(zip(snap.venue, snap.symbol, mk))
+        before = len(deep)
+        dmk = np.where(deep["market_type"] == "spot", "spot", "perp")
+        deep = deep[[(v, s_, m) in live
+                     for v, s_, m in zip(deep.venue, deep.symbol, dmk)]]
+        print(f"== 4. reusing cached deep history: {before} -> {len(deep)} rows "
+              f"after re-applying the spec filters ==")
+    else:
+        print(f"== 4. deep history {start} .. {end} ==")
+        kinds = ["linear_perp"] + ([] if a.no_spot else ["spot"])
+        tgt = snap[snap["asset_key"].isin(sl["asset_key"]) & (snap["is_excluded"] == 0)
+                   & (snap["active"] == 1) & (snap["kind"].isin(kinds))]
+        inst = [resolve(r.venue, r.kind, r.base_raw, r.quote) for r in tgt.itertuples()]
+        # resolve() re-derives the native symbol; keep only those that round-trip
+        ok = [i for i, r in zip(inst, tgt.itertuples()) if i.symbol == r.symbol]
+        nsp = sum(i.market_type == "spot" for i in ok)
+        print(f"   {len(ok)}/{len(inst)} round-tripped to a native symbol "
+              f"({len(ok) - nsp} perp, {nsp} spot)")
+        deep = fetch_deep(ok, start, end, fx, workers=8)
+        deep.to_parquet(OUT / "deep_daily.parquet", index=False)
+        print(f"   {len(deep)} daily rows")
+
+    print("== 5. asset metrics ==")
+    m = asset_metrics(deep, snap, spec)
+    m["traded"] = m["asset_key"].isin(traded_assets)
+    m.to_parquet(OUT / "asset_metrics.parquet", index=False)
+    vm = venue_metrics(deep, snap, spec, mp)
+    vm.to_parquet(OUT / "venue_metrics.parquet", index=False)
+    print(f"   {len(vm)} asset x venue rows -> venue_metrics.parquet")
+    print(f"   {len(m)} assets scored -> {OUT/'asset_metrics.parquet'}")
+
+
+if __name__ == "__main__":
+    main()

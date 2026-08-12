@@ -1,0 +1,25 @@
+# Asset-universe nightly pipeline.  Install with:
+#     crontab /home/vhuang/darius/darius_analysis/asset_universe/crontab
+# NOTE: `crontab <file>` REPLACES the whole crontab. Add other jobs to this file
+# rather than installing them separately, or they will be wiped.
+#
+# Verify:  crontab -l
+# Remove:  crontab -r
+#
+# Schedule is LOCAL time (America/New_York, UTC-4/-5). 04:00 local = 08:00 UTC in
+# summer, 09:00 in winter. Both are safely past the ~02:00 UTC floor at which all
+# five venues have settled the previous UTC day (OKX and Bitget close their native
+# day at 16:00 UTC - see PIPELINE.md 2.1), so DST cannot break it.
+#
+# Stages: run_screen.py (REST pull, ~25 min with spot) -> ch_load.py
+#         -> history.py -> build_report.py
+# Exit codes: 0 ok | 2 missing artifacts | 3 too many unresolved instruments
+#             4 validation gate failed | 5 stage crashed | 75 already running
+# Per-run detail: asset_universe/logs/daily_<stamp>.log (self-prunes after 30d)
+# Was it clean?  SELECT * FROM symbol_stats.load_runs ORDER BY run_ts DESC
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+
+0 4 * * * /home/vhuang/darius/darius_analysis/asset_universe/daily_job.sh >> /home/vhuang/darius/darius_analysis/asset_universe/logs/cron.log 2>&1

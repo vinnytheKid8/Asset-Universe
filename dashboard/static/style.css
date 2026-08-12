@@ -1,0 +1,228 @@
+:root{
+  color-scheme: light;
+  --surface:#fcfcfb; --plane:#f4f4f1; --card:#ffffff;
+  --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e6e5df; --axis:#c3c2b7; --line:rgba(11,11,11,.12);
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+  --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+  --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --crit:#d03b3b;
+  --keep:#2a78d6; --add:#1baf7a; --watch:#eda100; --drop:#d03b3b;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --surface:#1a1a19; --plane:#0f0f0e; --card:#212120;
+    --ink:#ffffff; --ink2:#c3c2b7; --muted:#8b8a84;
+    --grid:#2c2c2a; --axis:#3a3a37; --line:rgba(255,255,255,.12);
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+    --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+    --keep:#3987e5; --add:#199e70; --watch:#c98500; --drop:#d03b3b;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --surface:#1a1a19; --plane:#0f0f0e; --card:#212120;
+  --ink:#ffffff; --ink2:#c3c2b7; --muted:#8b8a84;
+  --grid:#2c2c2a; --axis:#3a3a37; --line:rgba(255,255,255,.12);
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+  --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+  --keep:#3987e5; --add:#199e70; --watch:#c98500; --drop:#d03b3b;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--plane);color:var(--ink);
+  font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--s1)}
+h1,h2,h3{margin:0;font-weight:640}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums;text-align:right}
+
+/* ---- shell ---- */
+header{position:sticky;top:0;z-index:20;background:var(--surface);
+  border-bottom:1px solid var(--line);padding:9px 16px;
+  display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+header h1{font-size:15px;letter-spacing:-.2px}
+header .sub{color:var(--muted);font-size:12px}
+nav{display:flex;gap:2px;margin-left:auto}
+nav button{background:none;border:1px solid transparent;color:var(--ink2);
+  padding:6px 13px;border-radius:7px;cursor:pointer;font:inherit;font-size:13px}
+nav button:hover{background:var(--plane)}
+nav button.on{background:var(--s1);color:#fff;border-color:var(--s1)}
+main{padding:16px;max-width:100%;overflow-x:hidden}
+.view{display:none} .view.on{display:block}
+
+/* ---- cards ---- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:11px;
+  padding:14px 16px;margin-bottom:14px;min-width:0;max-width:100%}
+.card>h2{font-size:13px;text-transform:uppercase;letter-spacing:.6px;
+  color:var(--muted);margin-bottom:10px;font-weight:600}
+.card>h2 small{text-transform:none;letter-spacing:0;font-weight:400;margin-left:8px}
+.row{display:flex;gap:14px;flex-wrap:wrap}
+/* min-width:0 is load-bearing. A grid/flex child defaults to min-width:auto, so a
+   wide table refuses to shrink and stretches the whole page instead of scrolling
+   inside its own .tw wrapper - which clips the stat tiles and the scatter. */
+.row>*{flex:1 1 320px;min-width:0}
+
+/* ---- stat tiles ---- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:10px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:12px 14px}
+.tile .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
+.tile .v{font-size:27px;font-weight:660;letter-spacing:-.6px;margin-top:2px}
+.tile .d{font-size:12px;margin-top:1px;color:var(--muted)}
+.tile .d.up{color:var(--good)} .tile .d.dn{color:var(--crit)}
+.tile.keep .v{color:var(--keep)} .tile.add .v{color:var(--add)}
+.tile.watch .v{color:var(--watch)} .tile.drop .v{color:var(--drop)}
+
+/* ---- calibration sidebar ---- */
+.calib{display:grid;grid-template-columns:296px minmax(0,1fr);gap:14px;align-items:start}
+.calib>*{min-width:0}
+@media (max-width:1100px){.calib{grid-template-columns:1fr}}
+.knobs{position:sticky;top:64px}
+.knob{margin-bottom:13px}
+.knob label{display:flex;justify-content:space-between;font-size:12px;color:var(--ink2);
+  margin-bottom:3px;gap:8px}
+.knob label b{font-variant-numeric:tabular-nums;font-weight:640;color:var(--ink)}
+.knob input[type=range]{width:100%;accent-color:var(--s1);margin:0}
+.knob.changed label b{color:var(--s2)}
+.knobgroup{border-top:1px solid var(--line);margin:14px 0 11px;padding-top:11px}
+.knobgroup:first-of-type{border:0;margin-top:0;padding-top:0}
+.knobgroup h3{font-size:11px;text-transform:uppercase;letter-spacing:.6px;
+  color:var(--muted);margin-bottom:9px}
+button.btn{background:var(--s1);color:#fff;border:0;border-radius:7px;padding:7px 13px;
+  cursor:pointer;font:inherit;font-size:13px}
+button.btn.ghost{background:transparent;color:var(--ink2);border:1px solid var(--line)}
+button.btn:disabled{opacity:.45;cursor:default}
+
+/* ---- controls ---- */
+.ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+input[type=text],input[type=search],select{background:var(--surface);color:var(--ink);
+  border:1px solid var(--line);border-radius:7px;padding:6px 9px;font:inherit;font-size:13px}
+input[type=search]{min-width:210px}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;
+  cursor:pointer;color:var(--ink2);user-select:none}
+.chip.on{background:var(--s1);border-color:var(--s1);color:#fff}
+.chip.on.keep{background:var(--keep);border-color:var(--keep)}
+.chip.on.add{background:var(--add);border-color:var(--add)}
+.chip.on.watch{background:var(--watch);border-color:var(--watch);color:#000}
+.chip.on.drop{background:var(--drop);border-color:var(--drop)}
+
+/* ---- tables ---- */
+.tw{overflow:auto;max-height:74vh;border:1px solid var(--line);border-radius:9px}
+table{border-collapse:separate;border-spacing:0;width:100%;font-size:12.5px}
+th,td{padding:5px 9px;white-space:nowrap;border-bottom:1px solid var(--line)}
+th{position:sticky;top:0;background:var(--surface);z-index:3;text-align:left;
+  font-weight:600;color:var(--ink2);cursor:pointer;user-select:none}
+th:hover{color:var(--ink)}
+th.sorted::after{content:" ▾";color:var(--s1)}
+th.sorted.asc::after{content:" ▴"}
+tbody tr:hover{background:var(--plane)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.k{position:sticky;left:0;background:var(--card);font-weight:600;z-index:2}
+tbody tr:hover td.k{background:var(--plane)}
+
+/* ---- column emphasis -------------------------------------------------------
+   Live figures are what you act on; the 30d medians are what the screen scores.
+   Both belong in the table, but they must not read as equals: .now is promoted
+   (tinted band, full-contrast, heavier) and .slow is demoted to a footnote
+   weight. .grp draws the divider so the bands are legible without a second
+   header row (which would break click-to-sort). */
+/* rgba first as the fallback: an engine without color-mix keeps the tint rather than
+   dropping the emphasis entirely, which would silently undo the whole point */
+td.now{background:rgba(42,120,214,.07);
+  background:color-mix(in srgb,var(--s1) 7%,transparent);
+  color:var(--ink);font-weight:640}
+th.now{background:rgba(42,120,214,.12);
+  background:color-mix(in srgb,var(--s1) 12%,var(--surface));color:var(--ink)}
+tbody tr:hover td.now{background:rgba(42,120,214,.13);
+  background:color-mix(in srgb,var(--s1) 13%,var(--plane))}
+td.slow,th.slow{color:var(--muted);font-weight:400}
+th.grp,td.grp{border-left:2px solid var(--line)}
+th.now.grp{border-left:2px solid var(--s1)}
+
+.x-up{color:var(--s2);font-weight:680}
+.x-dn{color:var(--drop);font-weight:680}
+/* direction: the glyph is the signal, colour is reinforcement (CVD-safe pairing —
+   teal/orange, not red/green, and never colour alone) */
+.chg-up{color:var(--s3);font-weight:680;font-variant-numeric:tabular-nums}
+.chg-dn{color:var(--s2);font-weight:680;font-variant-numeric:tabular-nums}
+.chg-flat{color:var(--muted);font-variant-numeric:tabular-nums}
+.stale{color:var(--warn);font-weight:640}
+.stale::after{content:" ⚠"}
+
+/* legend chips above the leg table */
+.bandkey{display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+  margin:0 0 8px;color:var(--muted);font-size:12px}
+.bandkey b{color:var(--ink);font-weight:640}
+.bandkey .sw{display:inline-block;width:11px;height:11px;border-radius:3px;
+  vertical-align:-1px;margin-right:5px}
+.bandkey .sw-now{background:color-mix(in srgb,var(--s1) 45%,transparent);
+  border:1px solid var(--s1)}
+.bandkey .sw-slow{background:var(--plane);border:1px solid var(--line)}
+.v-keep{color:var(--keep);font-weight:640} .v-add{color:var(--add);font-weight:640}
+.v-watch{color:var(--watch);font-weight:640} .v-drop{color:var(--drop);font-weight:640}
+.moved{box-shadow:inset 3px 0 0 var(--s2)}
+.fail{color:var(--crit)} .pass{color:var(--muted)}
+.pill{font-size:11px;border:1px solid var(--line);border-radius:999px;padding:1px 7px;color:var(--ink2)}
+.clickable{cursor:pointer;text-decoration:underline;text-decoration-style:dotted}
+
+/* ---- charts ---- */
+.chartbox{position:relative;min-width:0;overflow:hidden}
+.chart .grid{stroke:var(--grid);stroke-width:1}
+.chart .axisline{stroke:var(--axis);stroke-width:1}
+.chart text.axis{fill:var(--muted);font-size:10.5px;font-variant-numeric:tabular-nums}
+.chart .hair{stroke:var(--axis);stroke-width:1;stroke-dasharray:0}
+.chart .refline{stroke:var(--s2);stroke-width:1.4;stroke-dasharray:5 4;opacity:.85}
+.chart text.reflabel{fill:var(--s2);font-size:10.5px}
+.chart text.ptlabel{fill:var(--ink2);font-size:10.5px}
+.chart .pt{transition:r .08s}
+.tip{position:absolute;display:none;background:var(--surface);border:1px solid var(--line);
+  border-radius:8px;padding:7px 9px;font-size:12px;pointer-events:none;z-index:9;
+  box-shadow:0 6px 22px rgba(0,0,0,.16);max-width:330px}
+.tip table{width:100%;font-size:11.5px;margin-top:3px}
+.tip td{padding:1px 0;border:0;white-space:nowrap}
+.tip td:last-child{text-align:right;padding-left:12px;font-variant-numeric:tabular-nums}
+.tip tr.tot td{border-top:1px solid var(--line);font-weight:640}
+.tip i,.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:7px;font-size:12px;color:var(--ink2)}
+.legend .lg{cursor:pointer;user-select:none}
+.legend .lg.off{opacity:.35;text-decoration:line-through}
+.empty{color:var(--muted);padding:26px;text-align:center;font-size:13px}
+
+/* ---- hbars ---- */
+.hbars{display:flex;flex-direction:column;gap:3px}
+.hbar{display:grid;grid-template-columns:132px 1fr 92px;gap:9px;align-items:center;font-size:12.5px}
+.hbar .hl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hbar .ht{background:var(--plane);border-radius:3px;height:15px;overflow:hidden}
+.hbar .ht i{display:block;height:100%;border-radius:3px}
+.hbar .hv{text-align:right;font-variant-numeric:tabular-nums;color:var(--ink2)}
+
+.note{color:var(--muted);font-size:12px;margin-top:8px;line-height:1.5}
+.err{background:#d03b3b18;border:1px solid #d03b3b55;color:var(--crit);
+  padding:9px 12px;border-radius:8px;margin-bottom:12px;font-size:13px}
+textarea{width:100%;background:var(--surface);color:var(--ink);border:1px solid var(--line);
+  border-radius:7px;padding:9px;font:12.5px ui-monospace,Menlo,monospace;min-height:88px}
+
+/* ---- methodology ---- */
+.meth{max-width:900px;line-height:1.6}
+.meth h3{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
+  margin:22px 0 8px}
+.meth h3:first-child{margin-top:0}
+.meth p{margin:0 0 10px;color:var(--ink2)}
+.meth b{color:var(--ink)}
+.meth pre{background:var(--plane);border:1px solid var(--line);border-radius:8px;
+  padding:11px 13px;margin:0 0 12px;overflow-x:auto;
+  font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink)}
+.meth pre .chgd{color:var(--s2);font-weight:700}
+
+/* methodology, inline on the screen page */
+.meth-card{padding:0}
+.meth-card>summary{cursor:pointer;padding:14px 16px;list-style:none;
+  display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;user-select:none}
+.meth-card>summary::-webkit-details-marker{display:none}
+.meth-card>summary::before{content:"▸";color:var(--muted);font-size:12px}
+.meth-card[open]>summary::before{content:"▾"}
+.meth-card>summary:hover{background:var(--plane)}
+.meth-card>summary b{font-size:13px;text-transform:uppercase;letter-spacing:.6px;
+  color:var(--ink2);font-weight:600}
+.meth-card>#method{padding:0 16px 16px}
+.meth-card .meth{max-width:none}

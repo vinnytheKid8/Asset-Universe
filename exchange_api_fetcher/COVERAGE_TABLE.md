@@ -1,0 +1,22 @@
+| metric | BGT | BIN | GAT | KCN | KRAKEN | OKX |
+|---|---|---|---|---|---|---|
+| `basis_history` | n/a | 500.0 | n/a | n/a | n/a | n/a |
+| `bbo_all_symbols` | 743.0 | 730.0 | 889.0 | 679.0 | n/a | 438.0 |
+| `bbo_all_symbols_spot` | 1234.0 | 3683.0 | 2220.0 | 1018.0 | n/a | 1335.0 |
+| `book_depth` | 100.0 | 1.0 | 1.0 | 20.0 | n/a | 1.0 |
+| `funding_interval_cap` | 1.0 | 746.0 | n/a | n/a | n/a | n/a |
+| `funding_settled` | 100.0 | 500.0 | 90.0 | 100.0 | n/a | 100.0 |
+| `fx_usdc_usd` | n/a | n/a | n/a | n/a | 721.0 | n/a |
+| `fx_usdt_usd` | n/a | n/a | n/a | n/a | 721.0 | n/a |
+| `index_klines` | 90.0 | 500.0 | 100.0 | n/a | n/a | 100.0 |
+| `liquidations` | n/a | n/a | 100.0 | n/a | n/a | n/a |
+| `lsr_account` | 24.0 | 31.0 | 100.0 | n/a | n/a | 180.0 |
+| `mark_klines` | 90.0 | 500.0 | 100.0 | n/a | n/a | 100.0 |
+| `ohlcv_daily` | 90.0 | 1500.0 | 1000.0 | 200.0 | n/a | 100.0 |
+| `ohlcv_hourly` | 200.0 | 1500.0 | 1000.0 | 200.0 | n/a | 300.0 |
+| `oi_current` | 1.0 | n/a | n/a | n/a | n/a | n/a |
+| `oi_history` | n/a | 31.0 | 100.0 | 70.0 | n/a | 100.0 |
+| `premium_klines` | n/a | 500.0 | n/a | n/a | n/a | n/a |
+| `specs_perp` | 743.0 | 854.0 | 889.0 | 679.0 | n/a | 439.0 |
+| `specs_spot` | 1234.0 | 3680.0 | 2220.0 | 1018.0 | n/a | 1335.0 |
+| `taker_ratio` | n/a | 31.0 | 100.0 | n/a | n/a | - |

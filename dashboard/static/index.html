@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Universe calibration</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Universe calibration</h1>
+  <span class="sub" id="hdr-sub">loading…</span>
+  <select id="run-date" title="screen run"></select>
+  <nav>
+    <button data-v="screen" class="on">Screen</button>
+    <button data-v="assets">Assets</button>
+    <button data-v="detail">Asset detail</button>
+    <button data-v="venues">Venues</button>
+    <button data-v="history">Changes</button>
+    <button data-v="health">Data health</button>
+    <button data-v="sql">SQL</button>
+    <button id="theme" title="light / dark">◑</button>
+  </nav>
+</header>
+
+<main>
+<div id="err"></div>
+
+<!-- ============================ SCREEN ============================ -->
+<section class="view on" id="v-screen">
+  <div class="calib">
+    <div class="card knobs">
+      <h2>Gates &amp; weights</h2>
+      <div id="knobs"></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn ghost" id="reset">Reset to baseline</button>
+        <button class="btn ghost" id="copylink" title="copy a URL that reproduces these settings">Link</button>
+      </div>
+      <div class="note">Every change re-runs <span class="mono">build_report.score()</span>
+        server-side — the same function the nightly job and the HTML report use, so what you
+        see here is what the pipeline would decide.</div>
+    </div>
+
+    <div>
+      <div class="tiles" id="tiles"></div>
+
+      <div class="card" style="margin-top:14px">
+        <h2>The screen <small id="scatter-sub"></small></h2>
+        <div class="ctl">
+          <label>x <select id="sx"></select></label>
+          <label>y <select id="sy"></select></label>
+          <label><input type="checkbox" id="sxlog" checked> log x</label>
+          <label><input type="checkbox" id="sylog" checked> log y</label>
+          <span style="margin-left:auto"></span>
+          <span class="chip on keep" data-vf="keep">keep</span>
+          <span class="chip on add" data-vf="add">add</span>
+          <span class="chip on watch" data-vf="watch">watch</span>
+          <span class="chip on drop" data-vf="drop">drop</span>
+          <label><input type="checkbox" id="movedonly"> only movers</label>
+        </div>
+        <div class="chartbox" id="scatter"></div>
+        <div class="note">Click a point to open its detail. Marks with a dark ring
+          changed verdict versus the baseline gates.</div>
+      </div>
+
+      <div class="card">
+        <h2>What moved <small id="moved-sub">versus baseline settings</small></h2>
+        <div class="tw" style="max-height:38vh"><table id="t-moved"></table></div>
+      </div>
+
+      <div class="card">
+        <h2>Decision list <small>sorted by composite</small></h2>
+        <div class="ctl">
+          <input type="search" id="q-screen" placeholder="filter assets…">
+          <button class="btn ghost" id="csv-screen">CSV</button>
+        </div>
+        <div class="tw"><table id="t-screen"></table></div>
+      </div>
+
+      <details class="card meth-card" id="meth-card">
+        <summary><b>How the score is computed</b>
+          <span class="note" style="margin:0">every formula, with the sliders above
+            substituted in — open it while you calibrate</span></summary>
+        <div id="method"></div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ ASSETS ============================ -->
+<section class="view" id="v-assets">
+  <div class="card">
+    <h2>Every asset, every metric <small id="assets-sub"></small></h2>
+    <div class="ctl">
+      <input type="search" id="q-assets" placeholder="filter…">
+      <select id="f-class"><option value="">all classes</option></select>
+      <select id="f-traded"><option value="">traded &amp; not</option>
+        <option value="1">we trade it</option><option value="0">we don't</option></select>
+      <button class="btn ghost" id="csv-assets">CSV</button>
+      <span class="note" style="margin:0">click a row to open detail</span>
+    </div>
+    <div class="tw"><table id="t-assets"></table></div>
+  </div>
+</section>
+
+<!-- ============================ DETAIL ============================ -->
+<section class="view" id="v-detail">
+  <div class="card">
+    <div class="ctl">
+      <select id="d-asset" style="min-width:190px"></select>
+      <select id="d-days">
+        <option value="30">30 days</option><option value="90">90 days</option>
+        <option value="400" selected>everything</option>
+      </select>
+      <select id="d-mkt" title="which market the venue charts show">
+        <option value="perp" selected>perp</option>
+        <option value="spot">spot</option>
+        <option value="all">perp + spot</option>
+      </select>
+      <label title="volume and OI span orders of magnitude on any asset that has pumped;
+on a linear axis the whole pre-spike history flattens to nothing"><input type="checkbox"
+        id="d-log"> log volume / OI</label>
+      <span id="d-badges"></span>
+    </div>
+    <div class="tiles" id="d-tiles"></div>
+  </div>
+  <div class="row">
+    <div class="card"><h2>Volume by venue <small>USD/day, stacked</small></h2>
+      <div class="chartbox" id="d-vol"></div></div>
+    <div class="card"><h2>Open interest by venue <small>USD</small></h2>
+      <div class="chartbox" id="d-oi"></div></div>
+  </div>
+  <div class="row">
+    <div class="card"><h2>Venue share <small>% of daily volume</small></h2>
+      <div class="chartbox" id="d-share"></div></div>
+    <div class="card"><h2>Funding APR by venue <small>%</small></h2>
+      <div class="chartbox" id="d-fund"></div></div>
+  </div>
+  <div class="row">
+    <div class="card"><h2>Price <small>scale-normalised, per venue</small></h2>
+      <div class="chartbox" id="d-px"></div></div>
+    <div class="card"><h2>Cross-venue price agreement <small>bps — health check</small></h2>
+      <div class="chartbox" id="d-agree"></div></div>
+  </div>
+  <div class="card"><h2>Composite history <small>across screen runs</small></h2>
+    <div class="chartbox" id="d-hist"></div>
+    <div class="note" id="d-hist-note"></div></div>
+  <div class="card"><h2>Instruments <small id="legs-sub">this asset on every venue</small></h2>
+    <div class="bandkey">
+      <span><span class="sw sw-now"></span><b>Now</b> — last 24h from the snapshot taken
+        during the nightly run, plus the last complete UTC day</span>
+      <span><span class="sw sw-slow"></span><b>30d medians</b> — what the screen scores on,
+        deliberately slow to move</span>
+      <span><b>vs 14d peak</b> + <b>peak age</b> is the "rolling over" read — the only
+        pair that works while a pump is still inside every window. <b>Δ1d</b> is not
+        calendar-adjusted (weekday shown in <b>Through</b>); <b>vs same wkday</b>
+        is.</span>
+    </div>
+    <div class="tw" style="max-height:44vh"><table id="t-legs"></table></div></div>
+</section>
+
+<!-- ============================ VENUES ============================ -->
+<section class="view" id="v-venues">
+  <div class="card">
+    <h2>Asset × venue <small id="venues-sub"></small></h2>
+    <div class="ctl">
+      <input type="search" id="q-venues" placeholder="filter…">
+      <select id="f-venue"><option value="">all venues</option></select>
+      <select id="f-quote"><option value="">quoted &amp; not</option>
+        <option value="0">we don't quote it</option><option value="1">we quote it</option></select>
+      <select id="f-mkt"><option value="">perp &amp; spot</option>
+        <option value="linear_perp">perp</option><option value="spot">spot</option></select>
+      <button class="btn ghost" id="csv-venues">CSV</button>
+    </div>
+    <div id="gap-note" class="note"></div>
+    <div class="tw"><table id="t-venues"></table></div>
+  </div>
+</section>
+
+<!-- ============================ HEALTH ============================ -->
+<section class="view" id="v-health">
+  <div class="card"><h2>Loads <small>did the nightly job run, and was it clean?</small></h2>
+    <div class="tw" style="max-height:34vh"><table id="t-loads"></table></div></div>
+  <div class="row">
+    <div class="card"><h2>Cross-venue price agreement <small>bps, USDT-only, scale-normalised</small></h2>
+      <div class="chartbox" id="h-agree"></div>
+      <div class="note">Validation gate 1. Single digits is healthy; tens of bps means a
+        day-boundary or unit bug, not a market. This is the check that caught the UTC+8
+        candle trap.</div></div>
+    <div class="card"><h2>Instruments per venue <small>a silent drop is the likeliest failure</small></h2>
+      <div class="chartbox" id="h-cov"></div></div>
+  </div>
+  <div class="row">
+    <div class="card"><h2>Worst price disagreement <small>collision or missing scale factor</small></h2>
+      <div class="tw" style="max-height:34vh"><table id="t-worst"></table></div></div>
+    <div class="card"><h2>Possible duplicate tickers <small>same name, different asset</small></h2>
+      <div class="tw" style="max-height:34vh"><table id="t-dups"></table></div></div>
+  </div>
+  <div class="row">
+    <div class="card"><h2>Load rejects <small>quarantined, never filled</small></h2>
+      <div class="tw" style="max-height:30vh"><table id="t-rejects"></table></div></div>
+    <div class="card"><h2>Unmapped internal symbols <small>we trade it, we can't identify it</small></h2>
+      <div class="tw" style="max-height:30vh"><table id="t-unmapped"></table></div></div>
+  </div>
+</section>
+
+
+<!-- ============================ HISTORY ============================ -->
+<section class="view" id="v-history">
+  <div class="tiles" id="hist-tiles"></div>
+  <div class="card">
+    <h2>Dropped from the config <small id="drop-sub"></small></h2>
+    <div class="note">Instruments that appear in <span class="mono">symbols_record</span>
+      but not in that server's most recent publish. <span class="mono">last_seen</span> is
+      the last config that still had them, so it dates the drop.</div>
+    <div class="ctl"><input type="search" id="q-drop" placeholder="filter…">
+      <button class="btn ghost" id="csv-drop">CSV</button></div>
+    <div class="tw" style="max-height:44vh"><table id="t-dropped"></table></div>
+  </div>
+  <div class="card">
+    <h2>Newly listed <small id="new-sub"></small></h2>
+    <div class="ctl">
+      <label>listed within <select id="new-days">
+        <option value="7">7 days</option><option value="14">14 days</option>
+        <option value="30" selected>30 days</option><option value="90">90 days</option>
+      </select></label>
+      <label><input type="checkbox" id="new-multi" checked> 2+ perp venues</label>
+      <input type="search" id="q-new" placeholder="filter…">
+      <button class="btn ghost" id="csv-new">CSV</button>
+    </div>
+    <div class="note">Per venue: <b>P</b> perp only, <b>S</b> spot only,
+      <b>P+S</b> both, <b>·</b> not listed. Age is measured from the
+      <b>venue-declared</b> listing date, which goes back to 2018 for perps. Only OKX
+      publishes spot listing dates, so an asset listed <i>only</i> on spot elsewhere
+      has no declared date and is excluded here rather than dated from when our own
+      snapshot first saw it — that would make every such pair look days old.</div>
+    <div class="tw" style="max-height:52vh"><table id="t-new"></table></div>
+  </div>
+  <div class="card">
+    <h2>Announced for the future <small>venues publish listing dates ahead of open</small></h2>
+    <div class="tw" style="max-height:26vh"><table id="t-upcoming"></table></div>
+  </div>
+  <div class="card">
+    <h2>Venue gaps on assets we trade <small>listed there, we are not on it</small></h2>
+    <div class="tw" style="max-height:40vh"><table id="t-gaps"></table></div>
+  </div>
+</section>
+
+<!-- ============================ SQL ============================ -->
+<section class="view" id="v-sql">
+  <div class="card">
+    <h2>Ad-hoc query <small>read-only, capped at 5,000 rows</small></h2>
+    <textarea id="sql">SELECT asset_key, verdict, round(vol_usd_med30/1e6) AS adv_musd,
+       toUInt8(n_venues) AS venues, round(spread_bps_med,2) AS spread_bps,
+       round(tick_bps_med,2) AS tick_bps, traded
+FROM symbol_stats.screen_runs
+WHERE run_date = (SELECT max(run_date) FROM symbol_stats.screen_runs)
+ORDER BY vol_usd_med30 DESC
+LIMIT 50</textarea>
+    <div class="ctl" style="margin-top:9px">
+      <button class="btn" id="run-sql">Run</button>
+      <button class="btn ghost" id="csv-sql">CSV</button>
+      <span class="note" style="margin:0" id="sql-note"></span>
+    </div>
+    <div class="tw"><table id="t-sql"></table></div>
+  </div>
+</section>
+</main>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
