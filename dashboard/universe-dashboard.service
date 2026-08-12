@@ -8,7 +8,7 @@
 #   journalctl -u universe-dashboard -f
 #
 # Paths below assume the vision layout: checkout at ~/asset_universe with its own
-# .venv inside it. Adjust WorkingDirectory / ExecStart / User for another box.
+# .venv inside it (the live deployment). Adjust these three paths for another box.
 
 [Unit]
 Description=Universe calibration dashboard
@@ -21,7 +21,7 @@ After=network-online.target clickhouse-server.service
 Type=simple
 User=vhuang
 Group=vhuang
-WorkingDirectory=/home/vhuang/asset_universe
+WorkingDirectory=/home/vhuang/Asset-Universe
 
 # On the ClickHouse box, skip the LAN round-trip. The explicit :8123 matters -
 # ch_load.py parses the port off this URL and a portless URL raises. Nothing here
@@ -30,14 +30,15 @@ Environment=CH_URL=http://localhost:8123/
 Environment=CH_USER=vinny
 Environment=CH_PASS=888
 
-# 127.0.0.1 on purpose. /api/query rejects anything that is not SELECT/WITH, which
-# is enough for a local tool and NOT enough for an open port - there is no auth in
-# front of it. Reach it over an SSH tunnel from your laptop:
-#     ssh -N -L 8815:127.0.0.1:8815 vision
-#     -> http://127.0.0.1:8815
-# To expose it on the LAN instead, change to --host 0.0.0.0 and put something that
-# authenticates in front of it, or firewall the port to known hosts.
-ExecStart=/home/vhuang/asset_universe/.venv/bin/python dashboard/app.py --host 127.0.0.1 --port 8815
+# 0.0.0.0, matching Hub on :8800 - reachable at http://192.168.50.39:8815/ from
+# anywhere on the LAN. 127.0.0.1 would bind loopback only and refuse every browser
+# that is not on vision itself.
+#
+# This port has no authentication, and the /api/query tab runs arbitrary
+# SELECT/WITH against ClickHouse. That is the same posture as Hub, which is already
+# open on this network; it is fine for a trusted LAN and must not be routed to
+# anything wider without auth in front.
+ExecStart=/home/vhuang/Asset-Universe/.venv/bin/python dashboard/app.py --host 0.0.0.0 --port 8815
 
 Restart=always
 RestartSec=5
