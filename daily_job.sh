@@ -2,20 +2,23 @@
 # Nightly universe pipeline: fetch -> score -> load -> report.
 #
 #   ./daily_job.sh              full run (refetches 30d of daily history)
-#   ./daily_job.sh --reuse-deep skip the REST pull, re-score cached history
-#   ./daily_job.sh --load-only  parquet -> ClickHouse only
+#   ./daily_job.sh --reuse-deep skip the REST pull, re-score the cached history
+#   ./daily_job.sh --load-only  cache -> ClickHouse only
 #
-# Install (runs 03:20 UTC daily; the machine's crontab is in local time, so check
-# `date` before picking the hour):
+# Install: edit ./crontab and run `crontab /path/to/asset_universe/crontab`. That
+# file is the source of truth for the schedule and carries the DST reasoning; do
+# not hand-write a second entry here or the two will drift.
 #
-#   crontab -e
-#   20 3 * * *  /home/vhuang/darius/darius_analysis/asset_universe/daily_job.sh >> \
-#               /home/vhuang/darius/darius_analysis/asset_universe/logs/cron.log 2>&1
+# NO LOCAL STATE. Stages hand off through asset_universe_cache.frames in
+# ClickHouse (ch_cache.py), not through data/*.parquet, so this can run on any box
+# that can reach the server - and --load-only / --reuse-deep work from a box that
+# never ran the fetch. Only logs/ and reports/ are written locally, and the report
+# is pushed to Hub anyway.
 #
-# Exit codes: 0 ok | 2 missing artifacts | 3 too many unresolved instruments
+# Exit codes: 0 ok | 2 nothing cached to load | 3 too many unresolved instruments
 #             4 validation gate failed | 5 a stage crashed | 75 already running
 #
-# Why 03:20 UTC: venue daily candles for the previous UTC day need to have
+# Why after ~02:00 UTC: venue daily candles for the previous UTC day need to have
 # settled everywhere, and OKX/Bitget close their native day at 16:00 UTC (we ask
 # for 1Dutc, but a late-arriving bar is still a real risk). Anything after ~02:00
 # UTC is safe; before 01:00 is not.
@@ -23,7 +26,16 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="/home/vhuang/darius/.venv"
+# Venv, in order: $AU_VENV, a .venv beside this script, then Bruce's shared one.
+# The middle case is what makes a second box (e.g. the ClickHouse host, where the
+# checkout is ~/asset_universe with its own .venv) need no config at all.
+VENV="${AU_VENV:-}"
+if [ -z "$VENV" ]; then
+    for cand in "$DIR/.venv" "/home/vhuang/darius/.venv"; do
+        if [ -f "$cand/bin/activate" ]; then VENV="$cand"; break; fi
+    done
+    VENV="${VENV:-/home/vhuang/darius/.venv}"      # for the error message below
+fi
 LOGDIR="$DIR/logs"
 LOCK="$DIR/.daily_job.lock"
 STAMP="$(date -u +%Y%m%d_%H%M%S)"
@@ -39,6 +51,12 @@ if ! flock -n 9; then
     exit 75
 fi
 
+# Fail loudly rather than falling through to the system python, which has none of
+# requirements.txt and would crash three stages in with an ImportError.
+if [ ! -f "$VENV/bin/activate" ]; then
+    echo "$(date -u +%FT%TZ) no venv at $VENV (set AU_VENV)" | tee -a "$LOG" >&2
+    exit 5
+fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 cd "$DIR" || exit 5

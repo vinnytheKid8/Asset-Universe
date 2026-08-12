@@ -1,0 +1,48 @@
+# Dashboard as a service, for running it on the ClickHouse box (Vision) where it
+# has to survive logout. Install:
+#
+#   sudo cp dashboard/universe-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now universe-dashboard
+#   systemctl status universe-dashboard
+#   journalctl -u universe-dashboard -f
+#
+# Paths below assume the vision layout: checkout at ~/asset_universe with its own
+# .venv inside it. Adjust WorkingDirectory / ExecStart / User for another box.
+
+[Unit]
+Description=Universe calibration dashboard
+# It only reads ClickHouse, so it is useless before ClickHouse is up - but it
+# retries rather than dying, hence Wants and not Requires.
+Wants=clickhouse-server.service
+After=network-online.target clickhouse-server.service
+
+[Service]
+Type=simple
+User=vhuang
+Group=vhuang
+WorkingDirectory=/home/vhuang/asset_universe
+
+# On the ClickHouse box, skip the LAN round-trip. The explicit :8123 matters -
+# ch_load.py parses the port off this URL and a portless URL raises. Nothing here
+# writes, but keep it consistent with the pipeline anyway.
+Environment=CH_URL=http://localhost:8123/
+Environment=CH_USER=vinny
+Environment=CH_PASS=888
+
+# 127.0.0.1 on purpose. /api/query rejects anything that is not SELECT/WITH, which
+# is enough for a local tool and NOT enough for an open port - there is no auth in
+# front of it. Reach it over an SSH tunnel from your laptop:
+#     ssh -N -L 8815:127.0.0.1:8815 vision
+#     -> http://127.0.0.1:8815
+# To expose it on the LAN instead, change to --host 0.0.0.0 and put something that
+# authenticates in front of it, or firewall the port to known hosts.
+ExecStart=/home/vhuang/asset_universe/.venv/bin/python dashboard/app.py --host 127.0.0.1 --port 8815
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import argparse
 import io
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import requests
 
+import ch_cache
 import ch_schema
 from exchange_api_fetcher.symbology import map_internal, parse_internal_names
 
@@ -131,9 +133,22 @@ def listing_history(spec: pd.DataFrame, traded_assets: set[str]) -> pd.DataFrame
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--run-date", default=None,
+                    help="YYYY-MM-DD (default: latest complete cached run)")
+    ap.add_argument("--data-dir", default=None, metavar="DIR",
+                    help="read local parquet instead of the ClickHouse frame cache")
     a = ap.parse_args()
-    from pathlib import Path
-    spec = pd.read_parquet(Path(__file__).parent / "data" / "instrument_ref.parquet")
+
+    if a.data_dir:
+        spec = pd.read_parquet(Path(a.data_dir) / "instrument_ref.parquet")
+    else:
+        cache = ch_cache.client()
+        run_date = (date.fromisoformat(a.run_date) if a.run_date
+                    else ch_cache.latest_run_date(ch=cache))
+        if run_date is None:
+            print(f"no complete run in {ch_cache.CACHE_DB} - run run_screen.py first")
+            return 2
+        spec = ch_cache.get_frame("instrument_ref", run_date, ch=cache)
 
     th = traded_history(spec)
     print(f"traded_history: {len(th)} instruments  "

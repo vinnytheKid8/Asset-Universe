@@ -5,7 +5,11 @@ rotating them in and out on evidence rather than on the last thing that happened
 
 Nightly it pulls every instrument on five venues from their REST APIs, normalises to
 real USD, scores each **asset** on market structure, writes the result to ClickHouse,
-and rebuilds an HTML report. A local web dashboard sits on top for calibration.
+and rebuilds an HTML report that is pushed to Hub. A web dashboard sits on top for
+calibration.
+
+**There is no local state.** Stages hand off through ClickHouse
+(`asset_universe_cache`), so any stage can run on any box that can reach the server.
 
 > **The cron is live on `Bruce`** (`vhuang`, 04:00 America/New_York = 08:00–09:00 UTC).
 > `crontab -l` to see it. Everything below is reproducible on any box, but the
@@ -45,10 +49,10 @@ cp exchange_api_fetcher/general_config.json.example \
 export CH_URL=http://192.168.50.39:8123/ CH_USER=vinny CH_PASS=...
 
 python ch_schema.py --create      # one-time; idempotent, safe to re-run
-python run_screen.py              # ~25 min: REST pull -> data/*.parquet
-python ch_load.py                 # parquet -> ClickHouse, with validation gates
+python run_screen.py              # ~25 min: REST pull -> asset_universe_cache
+python ch_load.py                 # cache -> symbol_stats, with validation gates
 python history.py                 # drop / new-listing history
-python build_report.py            # -> reports/universe_review.html
+python build_report.py            # -> reports/universe_review.html + Hub
 python dashboard/app.py           # -> http://127.0.0.1:8815
 ```
 
@@ -57,7 +61,7 @@ Or all of it the way the cron does:
 ```bash
 ./daily_job.sh                    # full run
 ./daily_job.sh --reuse-deep       # re-score cached history, no REST pull (fast)
-./daily_job.sh --load-only        # parquet -> ClickHouse only (seconds)
+./daily_job.sh --load-only        # cache -> ClickHouse only (seconds)
 ```
 
 ---
@@ -68,7 +72,9 @@ Or all of it the way the cron does:
 |---|---|
 | `run_screen.py` | the pipeline: specs → asset keys → snapshot → shortlist → 30d deep history → metrics |
 | `ch_schema.py` | ClickHouse DDL. Idempotent, with column migration; `--recreate` for sorting-key changes |
-| `ch_load.py` | parquet → ClickHouse: conforming, quarantine, validation gates |
+| `ch_load.py` | cache → `symbol_stats`: conforming, quarantine, validation gates |
+| `ch_cache.py` | the stage handoff: frames as parquet blobs in ClickHouse, keyed by `run_date` |
+| `hub.py` | pushes the HTML report to Hub (`additional_docs/HUB_ACCESS.md`) |
 | `history.py` | what we stopped trading, and what is newly listed anywhere |
 | `build_report.py` | scoring (`score()`, the single source of truth) + the static HTML report |
 | `daily_job.sh` | cron entry point: `flock`, logging, stage sequencing, log rotation |
@@ -80,8 +86,10 @@ Or all of it the way the cron does:
 | **`DATA_COVERAGE.md`** | per-venue endpoint registry and the gaps — read this before trusting a column |
 | **`GRAFANA.md`** | if you'd rather use Grafana than the bundled dashboard |
 
-`data/*.parquet` and `reports/*.html` are gitignored: every one is regenerable, and
-**ClickHouse is the source of truth**, not the working directory.
+`reports/*.html` and `logs/` are gitignored: every one is regenerable, and
+**ClickHouse is the source of truth**, not the working directory. `run_screen.py
+--data-dir DIR` still mirrors frames to parquet, but only as a debugging aid — no
+stage reads local disk by default.
 
 ---
 
@@ -97,6 +105,28 @@ Or all of it the way the cron does:
 | `asset_listings` | asset × venue × kind × run_date | listing dates and per-venue coverage |
 | `asset_daily`, `asset_listing_matrix` | views | roll-ups; no backfill to worry about |
 | `load_runs`, `load_rejects` | per load | "did last night run, was it clean" |
+
+### The frame cache (`asset_universe_cache`)
+
+One table, `frames`: the seven DataFrames `run_screen.py` produces, one row each per
+`run_date`, stored as parquet bytes.
+
+```sql
+SELECT run_date, frame, rows, cols, round(nbytes/1e6, 2) AS mb
+FROM asset_universe_cache.frames ORDER BY run_date DESC, frame
+```
+
+~4.3 MB per run, `TTL 180 days` (`AU_CACHE_TTL_DAYS`). Blobs rather than seven typed
+tables because **nothing SELECTs a column out of these** — every consumer reads the
+whole frame into pandas — so typed tables would buy nothing and cost a migration each
+time `run_screen` gains a column. Parquet also round-trips dtypes exactly, which
+matters: several of these frames carry nullable ints and all-NaN float columns that a
+naive columnar round-trip quietly changes. What you *do* query is `symbol_stats`.
+
+`python ch_cache.py --list` / `--check` to see what is cached and whether the last run
+is complete. A `run_date` missing any of `instrument_ref`, `deep_daily`,
+`asset_metrics`, `venue_metrics` is treated as an incomplete run and skipped, so a
+fetch that died halfway is never loaded as though it were whole.
 
 Panels need **neither `FINAL` nor `argMax`** — the loader `OPTIMIZE`s these tables
 after each run, so raw counts already equal deduplicated counts. That is affordable
@@ -133,7 +163,7 @@ Exit codes — anything non-zero is worth an alert:
 | code | meaning |
 |---|---|
 | 0 | ok |
-| 2 | missing artifacts (run `run_screen.py` first) |
+| 2 | nothing complete in the frame cache (run `run_screen.py` first) |
 | 3 | too many instruments failed identity resolution (>2%) — nothing loaded |
 | 4 | a validation gate failed — data loaded but treat it as suspect |
 | 5 | a stage crashed |
@@ -154,7 +184,12 @@ still designed but unbuilt: `PIPELINE.md` §8.
 Nothing is machine-specific except the cron and the accumulated history. To stand it
 up on another box: install, set `CH_URL`/`CH_USER`/`CH_PASS`, run `ch_schema.py
 --create`, then `./daily_job.sh`. Point it at a different database with `CH_DB` if you
-don't want to share `symbol_stats`.
+don't want to share `symbol_stats`, or `AU_CACHE_DB` for the frame cache.
+
+Because the handoff is in ClickHouse, the stages do not have to share a machine:
+`run_screen.py` on one box and `ch_load.py` / `build_report.py` on another both see
+the same `run_date`. `--load-only` and `--reuse-deep` work from a box that never ran
+the fetch.
 
 **Do not install a second cron against the same database.** Two writers would
 interleave `run_date` snapshots. `flock` only guards one machine.

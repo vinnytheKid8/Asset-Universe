@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+import ch_cache
+import hub
+
 HERE = Path(__file__).parent
-DATA, REPORTS = HERE / "data", HERE / "reports"
+REPORTS = HERE / "reports"
 
 # ---- gates (see FRAMEWORK.md §4.1) -----------------------------------------
 G_ADV, G_PERSIST, G_VENUES, G_OI = 5e6, 0.60, 3, 3e6
@@ -431,13 +434,38 @@ def money(v, unit="M"):
 
 # ============================================================ main
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--run-date", default=None,
+                    help="YYYY-MM-DD (default: latest complete cached run)")
+    ap.add_argument("--data-dir", default=None, metavar="DIR",
+                    help="read local parquet instead of the ClickHouse frame cache")
+    ap.add_argument("--out", default=None, help="output HTML path")
+    ap.add_argument("--no-hub", action="store_true", help="skip the Hub upload")
+    ap.add_argument("--hub-collection", type=int, default=None)
+    a = ap.parse_args()
+
+    # Frames come from the ClickHouse cache so this can run on a different box than
+    # the fetch; --data-dir stays as the local-parquet escape hatch.
+    if a.data_dir:
+        data = Path(a.data_dir)
+        run_date = date.fromisoformat(a.run_date) if a.run_date else None
+        read = lambda n: pd.read_parquet(data / f"{n}.parquet")   # noqa: E731
+    else:
+        cache = ch_cache.client()
+        run_date = (date.fromisoformat(a.run_date) if a.run_date
+                    else ch_cache.latest_run_date(ch=cache))
+        if run_date is None:
+            print(f"no complete run in {ch_cache.CACHE_DB} - run run_screen.py first")
+            return 2
+        read = lambda n: ch_cache.get_frame(n, run_date, ch=cache)   # noqa: E731
+
     REPORTS.mkdir(exist_ok=True)
-    m = score(pd.read_parquet(DATA / "asset_metrics.parquet"))
-    snap = pd.read_parquet(DATA / "snapshot.parquet")
-    spec = pd.read_parquet(DATA / "instrument_ref.parquet")
-    imap = pd.read_parquet(DATA / "internal_map.parquet")
-    dup = pd.read_parquet(DATA / "dup_tickers.parquet")
-    m.to_parquet(DATA / "asset_scores.parquet", index=False)
+    m = score(read("asset_metrics"))
+    snap = read("snapshot")
+    spec = read("instrument_ref")
+    imap = read("internal_map")
+    dup = read("dup_tickers")
 
     drops = m[m.verdict == "drop"].sort_values("vol_usd_med30")
     adds = m[m.verdict == "add"].sort_values("composite", ascending=False)
@@ -570,7 +598,7 @@ def main():
         else "<p class='muted'>none detected</p>")
 
     t_raw = raw_table(m.sort_values("vol_usd_mean30", ascending=False))
-    vm = pd.read_parquet(DATA / "venue_metrics.parquet")
+    vm = read("venue_metrics")
     order = m.set_index("asset_key")["vol_usd_mean30"].to_dict()
     vm["_o"] = vm["asset_key"].map(order).fillna(0)
     vm = vm.sort_values(["_o", "vol_usd_mean30"], ascending=[False, False])
@@ -608,11 +636,30 @@ def main():
             ["commodity", "index"])).sum()),
         g_adv=f"${G_ADV/1e6:.0f}M", g_persist=f"{G_PERSIST*100:.0f}%",
         g_venues=G_VENUES, g_oi=f"${G_OI/1e6:.0f}M")
-    out = REPORTS / "universe_review.html"
+    out = Path(a.out) if a.out else REPORTS / "universe_review.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html_doc, encoding="utf-8")
     print(f"-> {out}  ({out.stat().st_size/1024:.0f} KB)")
     print(f"   drop={len(drops)} add={len(adds)} keep={len(keeps)} watch={len(watch)}")
     print(f"   tick-pinned {n_pinned}/{len(m)} assets ({pinned_traded} of ours)")
+
+    # Hub gets a dated copy so the collection reads as a history rather than one
+    # file that changes under you. Never fatal: the report is already written, and
+    # a Hub outage should not make the nightly job look like a failed build.
+    if not a.no_hub:
+        stamp = run_date or datetime.now(timezone.utc).date()
+        try:
+            item = hub.upload_file(
+                out, f"universe_review_{stamp}.html",
+                collection_id=a.hub_collection or hub.COLLECTION_ID,
+                tags=("universe", "auto"), tagged_users=("vhuang",), replace=True,
+                description=(f"run_date {stamp} - {len(m)} assets: drop={len(drops)} "
+                             f"add={len(adds)} keep={len(keeps)} watch={len(watch)}"))
+            iid = (item.get("item") or item).get("id")
+            print(f"   -> hub item {iid} in collection "
+                  f"{a.hub_collection or hub.COLLECTION_ID}")
+        except Exception as e:                                   # noqa: BLE001
+            print(f"   WARNING hub upload failed: {e}")
 
 
 TEMPLATE = r"""<!doctype html>

@@ -4,7 +4,7 @@ A local web UI over `symbol_stats`. Reads live from ClickHouse, writes nothing.
 
 ```bash
 source /home/vhuang/darius/.venv/bin/activate
-python /home/vhuang/darius/darius_analysis/asset_universe/dashboard/app.py
+python /home/vhuang/darius/asset_universe/dashboard/app.py
 # -> http://127.0.0.1:8815
 
 python dashboard/app.py --host 0.0.0.0        # serve it from the ClickHouse box
@@ -14,6 +14,43 @@ python dashboard/app.py --port 9000 --reload  # dev
 No build step, no npm, no CDN. Four files: a FastAPI server and three static
 assets. Charts are hand-rolled SVG because the ClickHouse box may have no
 outbound internet and a CDN script tag is one more thing to break at 4am.
+
+`--reload` only works with `dashboard/` as the cwd — it passes `"app:app"` to
+uvicorn, which resolves the module against the cwd, not against this file.
+
+---
+
+## Running it on the ClickHouse box
+
+The dashboard is separable from the pipeline: it reads ClickHouse and writes
+nothing, so it does not need `data/*.parquet`, the venue configs, or the fetcher
+packages. Nine files and five pip packages:
+
+```
+ch_schema.py  build_report.py  ch_cache.py  hub.py
+dashboard/app.py  dashboard/static/{index.html,app.js,charts.js,style.css}
+
+pandas numpy requests fastapi uvicorn     # no pyarrow, no clickhouse-connect
+```
+
+`ch_cache.py` and `hub.py` come along because `build_report` imports them; the
+dashboard never calls either, and both import their heavy deps lazily, so the pip
+list is unchanged.
+
+`systemd` unit in `universe-dashboard.service` — it binds 127.0.0.1 and expects an
+SSH tunnel, because `/api/query` is a guard and not a sandbox (see below).
+
+**The catch: `build_report.py` must not drift between the two boxes.** The whole
+argument for `/api/screen` is that it calls the *same* `score()` the pipeline
+calls, so a JS reimplementation can't drift from it. Splitting the cron and the
+dashboard across two machines reintroduces exactly that drift one level down — edit
+`score()` or `DEFAULTS` where the cron runs, and the dashboard keeps serving the old
+scoring against the new data, with nothing in the UI to say so. It will look
+perfectly healthy and quietly answer calibration questions about a universe the
+pipeline no longer produces.
+
+So: whenever `build_report.py` changes, redeploy it to the dashboard box in the same
+motion. If these are two git checkouts, `git pull` on both is the deploy step.
 
 ---
 

@@ -1,8 +1,9 @@
-"""Load the universe-screen artifacts from data/*.parquet into ClickHouse.
+"""Load the universe-screen frames from the ClickHouse cache into symbol_stats.
 
-    python ch_load.py                      # load data/ as of today
+    python ch_load.py                      # latest complete cached run
     python ch_load.py --run-date 2026-08-06
     python ch_load.py --dry-run            # conform + validate, insert nothing
+    python ch_load.py --data-dir data/     # read local parquet instead
 
 Creates any missing tables first (ch_schema is idempotent), so a fresh machine
 needs no separate init step.
@@ -39,10 +40,10 @@ import clickhouse_connect
 import numpy as np
 import pandas as pd
 
+import ch_cache
 import ch_schema
 from ch_schema import DB, DEDUP_KEYS
 
-DATA = Path(__file__).parent / "data"
 log = logging.getLogger("ch_load")
 
 # Fail the load if more than this share of rows can't be identity-resolved.
@@ -303,8 +304,10 @@ def validate(ch) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data-dir", default=str(DATA))
-    ap.add_argument("--run-date", default=None, help="YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--data-dir", default=None, metavar="DIR",
+                    help="read local parquet instead of the ClickHouse frame cache")
+    ap.add_argument("--run-date", default=None,
+                    help="YYYY-MM-DD (default: latest complete cached run)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -313,26 +316,53 @@ def main() -> int:
         level=logging.DEBUG if a.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 
-    data = Path(a.data_dir)
-    run_ts = (datetime.fromisoformat(a.run_date).replace(tzinfo=timezone.utc)
-              if a.run_date else datetime.now(timezone.utc))
-    run_ts = run_ts.replace(microsecond=0, tzinfo=None)
-    run_date = run_ts.date()
+    # Input is the ClickHouse frame cache; --data-dir is the local-parquet escape
+    # hatch. Either way `read(name)` hands back the frame run_screen produced.
+    data = Path(a.data_dir) if a.data_dir else None
+    if data is not None:
+        missing = [f for f in ch_cache.REQUIRED if not (data / f"{f}.parquet").exists()]
+        if missing:
+            log.error("missing required artifacts in %s: %s - run run_screen.py first",
+                      data, missing)
+            return 2
+        run_date = (date.fromisoformat(a.run_date) if a.run_date
+                    else datetime.now(timezone.utc).date())
+        source = str(data)
 
-    need = ["instrument_ref", "deep_daily", "asset_metrics", "venue_metrics"]
-    missing = [f for f in need if not (data / f"{f}.parquet").exists()]
-    if missing:
-        log.error("missing required artifacts in %s: %s - run run_screen.py first",
-                  data, missing)
-        return 2
+        def read(name: str) -> pd.DataFrame:
+            return pd.read_parquet(data / f"{name}.parquet")
+    else:
+        cache = ch_cache.client()
+        # latest_run_date only returns a date whose every required frame is present,
+        # so a fetch that died halfway is skipped rather than loaded as if whole.
+        run_date = (date.fromisoformat(a.run_date) if a.run_date
+                    else ch_cache.latest_run_date(ch=cache))
+        if run_date is None:
+            log.error("no complete run in %s - run run_screen.py first",
+                      ch_cache.CACHE_DB)
+            return 2
+        gaps = ch_cache.missing(run_date, ch=cache)
+        if gaps:
+            log.error("cached run %s is missing %s - run run_screen.py first",
+                      run_date, gaps)
+            return 2
+        source = f"{ch_cache.CACHE_DB} run_date={run_date}"
 
-    log.info("loading %s -> %s%s  (run_date %s)", data, ch_schema.CH_URL, DB, run_date)
+        def read(name: str) -> pd.DataFrame:
+            return ch_cache.get_frame(name, run_date, ch=cache)
+
+    # run_ts stamps the load, run_date identifies the screen being loaded. They were
+    # the same value when both came from "now"; with a cached run they are not, and
+    # conflating them would date a backfill as though it were fetched today.
+    run_ts = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
+
+    log.info("loading %s -> %s%s  (run_date %s)", source, ch_schema.CH_URL, DB, run_date)
     ch_schema.create_all()
     ch = client()
     ldr = Loader(ch, run_ts, dry_run=a.dry_run)
 
     # ---- dimension --------------------------------------------------------- #
-    ref = pd.read_parquet(data / "instrument_ref.parquet")
+    ref = read("instrument_ref")
     ref["ingest_ts"] = run_ts
     ldr.load(ref, "instrument_ref")
 
@@ -348,7 +378,7 @@ def main() -> int:
     key = (ref.drop_duplicates(subset=["venue", "symbol", "mkt"])
               .set_index(["venue", "symbol", "mkt"])
               [["asset_key", "asset_class", "scale_factor"]])
-    deep = pd.read_parquet(data / "deep_daily.parquet")
+    deep = read("deep_daily")
     deep["ingest_ts"] = run_ts
     deep["mkt"] = np.where(deep["market_type"] == "spot", "spot", "perp")
     deep = deep.drop(columns=[c for c in ("asset_key", "asset_class", "scale_factor")
@@ -377,22 +407,22 @@ def main() -> int:
     # score() lives in build_report; import it so the load never depends on the
     # HTML having been regenerated first.
     from build_report import score
-    scores = score(pd.read_parquet(data / "asset_metrics.parquet"))
+    scores = score(read("asset_metrics"))
     scores.insert(0, "run_date", run_date)
     scores.insert(1, "run_ts", run_ts)
     ldr.load(scores, "screen_runs", replace_key="run_date")
 
-    vm = pd.read_parquet(data / "venue_metrics.parquet")
+    vm = read("venue_metrics")
     vm.insert(0, "run_date", run_date)
     ldr.load(vm, "screen_runs_venue", replace_key="run_date")
 
     for fname, table in (("dup_tickers", "screen_dup_tickers"),
                          ("internal_map", "internal_map")):
-        p = data / f"{fname}.parquet"
-        if not p.exists():
-            log.warning("%s.parquet absent, skipping %s", fname, table)
+        try:
+            df = read(fname)
+        except (KeyError, FileNotFoundError, OSError):
+            log.warning("%s absent, skipping %s", fname, table)
             continue
-        df = pd.read_parquet(p)
         df.insert(0, "run_date", run_date)
         ldr.load(df, table, replace_key="run_date")
 

@@ -1,5 +1,5 @@
 # Asset-universe nightly pipeline.  Install with:
-#     crontab /home/vhuang/darius/darius_analysis/asset_universe/crontab
+#     crontab /home/vhuang/darius/asset_universe/crontab
 # NOTE: `crontab <file>` REPLACES the whole crontab. Add other jobs to this file
 # rather than installing them separately, or they will be wiped.
 #
@@ -22,4 +22,4 @@ SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin
 MAILTO=""
 
-0 4 * * * /home/vhuang/darius/darius_analysis/asset_universe/daily_job.sh >> /home/vhuang/darius/darius_analysis/asset_universe/logs/cron.log 2>&1
+0 4 * * * /home/vhuang/darius/asset_universe/daily_job.sh >> /home/vhuang/darius/asset_universe/logs/cron.log 2>&1

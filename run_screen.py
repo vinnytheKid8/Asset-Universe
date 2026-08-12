@@ -1,9 +1,15 @@
-"""End-to-end universe screen. Writes parquet artifacts for the HTML report.
+"""End-to-end universe screen. Caches its frames to ClickHouse for the later stages.
 
     python run_screen.py [--days 30] [--top 90] [--no-deep]
+    python run_screen.py --reuse-deep              # re-score the last cached history
+    python run_screen.py --data-dir /tmp/screen    # + a local parquet mirror
 
 Stages: specs -> asset keys -> internal mapping -> venue-wide snapshot -> shortlist
 -> deep 30d daily history -> per-asset metrics.
+
+Output goes to `asset_universe_cache.frames` keyed by run_date (see ch_cache.py),
+not to local disk, so ch_load.py and build_report.py can run on a different host
+than this fetch.
 """
 from __future__ import annotations
 
@@ -17,6 +23,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+import ch_cache
+import ch_schema
 from exchange_api_fetcher.daily import resolve
 from exchange_api_fetcher.fx import FxTable
 from exchange_api_fetcher.screen import build_shortlist, fetch_deep, fetch_snapshot
@@ -25,8 +33,12 @@ from exchange_api_fetcher.symbology import (derive_asset_keys, map_internal,
                                             parse_internal_names)
 
 logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(message)s")
-OUT = Path(__file__).parent / "data"
-CH, AUTH = "http://192.168.50.39:8123/", ("vinny", "888")
+
+# Via ch_schema so CH_URL / CH_USER / CH_PASS override every stage at once. This
+# used to be a second hardcoded copy of the host, which meant setting CH_URL sent
+# ch_load.py to one server while this stage kept reading strat__*_alex off the old
+# one - a split-brain run that looks clean in the logs.
+CH, AUTH = ch_schema.CH_URL, (ch_schema.CH_USER, ch_schema.CH_PASS)
 
 
 def ch(sql: str) -> pd.DataFrame:
@@ -150,10 +162,14 @@ def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
             slope = (np.exp(slope) - 1) * 100          # %/day
         # same regression over the trailing 7 days only. vd is newest-first, so it is
         # reversed back to chronological order or the sign comes out backwards.
+        # w7, NOT v7: v7 is the scalar 7d median set above and still owed to
+        # vol_usd_med7 / vol_trend below. Rebinding it here put a 7-element array in
+        # both of those for every asset, which crashed the load and made the lane-A
+        # ADV gate (vol_usd_med7 >= g_adv) an array comparison.
         slope7 = np.nan
-        v7 = vd[:7][::-1]
-        if len(v7) >= 4:
-            slope7 = np.polyfit(np.arange(len(v7)), np.log(v7), 1)[0]
+        w7 = vd[:7][::-1]
+        if len(w7) >= 4:
+            slope7 = np.polyfit(np.arange(len(w7)), np.log(w7), 1)[0]
             slope7 = (np.exp(slope7) - 1) * 100
         return pd.Series({
             "days": g["date"].nunique(),
@@ -341,9 +357,14 @@ def main():
     ap.add_argument("--no-spot", action="store_true",
                     help="skip spot legs (perp-only, the pre-2026-08-10 behaviour)")
     ap.add_argument("--reuse-deep", action="store_true",
-                    help="load the existing deep_daily.parquet instead of refetching")
+                    help="reuse the last cached deep history instead of refetching")
+    ap.add_argument("--run-date", default=None,
+                    help="cache key, YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--data-dir", default=None, metavar="DIR",
+                    help="also mirror frames to local parquet (debugging only)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="skip ClickHouse; requires --data-dir")
     a = ap.parse_args()
-    OUT.mkdir(exist_ok=True)
     # UTC, not date.today(): every bar boundary in this pipeline is a true UTC day
     # (PIPELINE.md 2.1), and the box is America/New_York. A cron firing at 23:20
     # local is already 03:20 the next UTC day, so a local date silently fetches one
@@ -351,17 +372,38 @@ def main():
     today = datetime.now(timezone.utc).date()
     end = today - timedelta(days=1)
     start = end - timedelta(days=a.days - 1)
+    run_date = date.fromisoformat(a.run_date) if a.run_date else today
+
+    if a.no_cache and not a.data_dir:
+        ap.error("--no-cache leaves nowhere to put the frames; pass --data-dir too")
+
+    # The stage handoff lives in ClickHouse so ch_load / build_report can run on a
+    # different box than the fetch. --data-dir is a debugging mirror, not the path.
+    mirror = Path(a.data_dir) if a.data_dir else None
+    if mirror:
+        mirror.mkdir(parents=True, exist_ok=True)
+    ch = None
+    if not a.no_cache:
+        ch = ch_cache.client()
+        ch_cache.create_all(ch)
+
+    def emit(df: pd.DataFrame, name: str) -> None:
+        if ch is not None:
+            kb = ch_cache.put_frame(df, name, run_date, ch) / 1024
+            print(f"   -> cached {name} ({len(df)} rows, {kb:.0f} KB)")
+        if mirror is not None:
+            df.to_parquet(mirror / f"{name}.parquet", index=False)
 
     print("== 1. instrument specs ==")
     spec = derive_asset_keys(fetch_all())
-    spec.to_parquet(OUT / "instrument_ref.parquet", index=False)
+    emit(spec, "instrument_ref")
     print(f"   {len(spec)} instruments, {spec.active.sum()} active, "
           f"{spec.is_excluded.sum()} excluded")
 
     print("== 2. internal symbology mapping ==")
     trd = traded_instruments()
     mp = map_internal(parse_internal_names(trd["name"]), spec).merge(trd, on="name")
-    mp.to_parquet(OUT / "internal_map.parquet", index=False)
+    emit(mp, "internal_map")
     n_ok = (mp.match_rule != "UNMATCHED").sum()
     print(f"   {n_ok}/{len(mp)} internal instruments mapped; "
           f"rules={mp.match_rule.value_counts().to_dict()}")
@@ -369,23 +411,33 @@ def main():
     print("== 3. venue-wide snapshot ==")
     fx = FxTable(["USDT", "USDC", "USD"], start, today)
     snap = fetch_snapshot(spec, fx)
-    snap.to_parquet(OUT / "snapshot.parquet", index=False)
+    emit(snap, "snapshot")
     print(f"   {len(snap)} perp instruments, ${snap.vol24h_usd.sum()/1e9:.1f}B 24h")
 
     dup = find_duplicate_tickers(snap)
-    dup.to_parquet(OUT / "dup_tickers.parquet", index=False)
+    emit(dup, "dup_tickers")
     print(f"   {len(dup)} possible duplicate-ticker pairs")
 
     traded_assets = set(mp["asset_key"].dropna())
+    # Not persisted: the shortlist is consumed in this process to pick the deep-fetch
+    # targets, and nothing downstream ever read data/shortlist.parquet.
     sl = build_shortlist(snap, traded_assets, top_n=a.top)
-    sl.to_parquet(OUT / "shortlist.parquet", index=False)
     print(f"   shortlist {len(sl)} assets "
           f"({int(sl.traded.sum())} traded / {int((~sl.traded).sum())} candidates)")
 
     if a.no_deep:
         return
-    if a.reuse_deep and (OUT / "deep_daily.parquet").exists():
-        deep = pd.read_parquet(OUT / "deep_daily.parquet")
+    reused = None
+    if a.reuse_deep:
+        # Whatever the last run cached, from any box - the point of moving this off
+        # local disk. Refetch rather than die if there is nothing cached yet.
+        try:
+            reused = (pd.read_parquet(mirror / "deep_daily.parquet")
+                      if a.no_cache else ch_cache.get_frame("deep_daily", ch=ch))
+        except (KeyError, FileNotFoundError, OSError) as e:
+            print(f"   --reuse-deep: no cached deep history ({e}); refetching")
+    if reused is not None:
+        deep = reused
         # the spec fixes only REMOVE instruments, so the cached pull is a superset
         mk = np.where(snap["kind"] == "spot", "spot", "perp")
         live = set(zip(snap.venue, snap.symbol, mk))
@@ -407,17 +459,23 @@ def main():
         print(f"   {len(ok)}/{len(inst)} round-tripped to a native symbol "
               f"({len(ok) - nsp} perp, {nsp} spot)")
         deep = fetch_deep(ok, start, end, fx, workers=8)
-        deep.to_parquet(OUT / "deep_daily.parquet", index=False)
         print(f"   {len(deep)} daily rows")
+
+    # Emitted on the reuse path too, so every run_date is self-contained. Without
+    # this a --reuse-deep run would leave its own run_date missing deep_daily,
+    # ch_load would judge it incomplete, and fall back to loading the *previous*
+    # run's metrics under a silent one-day lag.
+    emit(deep, "deep_daily")
 
     print("== 5. asset metrics ==")
     m = asset_metrics(deep, snap, spec)
     m["traded"] = m["asset_key"].isin(traded_assets)
-    m.to_parquet(OUT / "asset_metrics.parquet", index=False)
+    emit(m, "asset_metrics")
     vm = venue_metrics(deep, snap, spec, mp)
-    vm.to_parquet(OUT / "venue_metrics.parquet", index=False)
-    print(f"   {len(vm)} asset x venue rows -> venue_metrics.parquet")
-    print(f"   {len(m)} assets scored -> {OUT/'asset_metrics.parquet'}")
+    emit(vm, "venue_metrics")
+    print(f"   {len(vm)} asset x venue rows, {len(m)} assets scored")
+    print(f"   run_date {run_date} cached to {ch_cache.CACHE_DB}"
+          + (f", mirrored to {mirror}" if mirror else ""))
 
 
 if __name__ == "__main__":
