@@ -226,3 +226,48 @@ textarea{width:100%;background:var(--surface);color:var(--ink);border:1px solid 
   color:var(--ink2);font-weight:600}
 .meth-card>#method{padding:0 16px 16px}
 .meth-card .meth{max-width:none}
+
+/* ---------------------------------------------------------------- summary + logs */
+/* Two columns where there is room, one where there isn't. min-width:0 is the
+   load-bearing rule from the README: without it a wide table refuses to shrink and
+   stretches the page instead of scrolling inside its own wrapper. */
+.sum-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));
+  gap:14px;align-items:start}
+.sum-grid>*{min-width:0}
+
+/* A separator between two chip groups that filter on different axes - without it
+   "drop | all" reads as one row of alternatives rather than two questions. */
+.ctl .sep{width:1px;align-self:stretch;background:var(--line);margin:0 4px}
+
+/* Stat tiles carry a headline number and a subordinate line. Values are tabular so
+   a column of them lines up on the decimal. */
+.tile-g{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px}
+.tile-g .t{background:var(--plane);border:1px solid var(--line);border-radius:9px;
+  padding:9px 11px}
+.tile-g .t .k{font-size:11px;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.04em}
+.tile-g .t .v{font-size:20px;font-weight:640;font-variant-numeric:tabular-nums;
+  color:var(--ink);line-height:1.25}
+.tile-g .t .s{font-size:11.5px;color:var(--ink2);font-variant-numeric:tabular-nums}
+
+.logbox{background:var(--plane);border:1px solid var(--line);border-radius:9px;
+  padding:11px 13px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--ink2);max-height:62vh;overflow:auto;white-space:pre;margin:0}
+/* Severity is carried by a word AND a colour, never colour alone. */
+.logbox .lw{color:var(--s4);font-weight:600}
+.logbox .le{color:var(--drop);font-weight:600}
+.logbox .lok{color:var(--s3)}
+
+/* Verdict group headers in the decision list. The colour is a left rule, not a fill:
+   a full-width tinted band competes with the verdict pills inside the rows. */
+tr.grouphead td{background:var(--plane);font-weight:640;font-size:11.5px;
+  text-transform:uppercase;letter-spacing:.05em;padding:7px 9px;
+  border-left:3px solid var(--muted);position:sticky;top:28px;z-index:2}
+tr.grouphead.v-drop td{border-left-color:var(--drop);color:var(--drop)}
+tr.grouphead.v-add  td{border-left-color:var(--add);color:var(--add)}
+tr.grouphead.v-watch td{border-left-color:var(--watch)}
+tr.grouphead.v-keep td{border-left-color:var(--keep);color:var(--keep)}
+tr.grouphead .gn{color:var(--muted);font-weight:500;margin-left:6px}
+/* Named points on the scatter: drops must read as drops even in the label layer. */
+text.ptlabel.lbl-drop{fill:var(--drop);font-weight:640}
+text.ptlabel.lbl-add{fill:var(--add)}

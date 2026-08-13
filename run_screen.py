@@ -69,6 +69,19 @@ def traded_instruments(days: int = 10) -> pd.DataFrame:
     return t[t["name"].str.match(r"^[A-Z]{3}-(S|P|IP|F|IF)-")].copy()
 
 
+def _med(s: pd.Series) -> float:
+    """median() that returns NaN for an all-NaN group without a numpy warning.
+
+    All-NaN is the NORMAL case for two of these, not an anomaly: trade counts are
+    Binance-only (DATA_COVERAGE.md) and spot rows carry no funding, so most groups
+    have nothing to take a median of. numpy's "Mean of empty slice" on every one of
+    them buries the warnings that do mean something. NaN is the correct answer here
+    and this returns it quietly.
+    """
+    s = s.dropna()
+    return float(s.median()) if len(s) else np.nan
+
+
 def find_duplicate_tickers(snap: pd.DataFrame, tol: float = 0.004) -> pd.DataFrame:
     """Same underlying listed under different tickers = a symbology collision we would
     otherwise count as two assets with one venue each.
@@ -76,7 +89,9 @@ def find_duplicate_tickers(snap: pd.DataFrame, tol: float = 0.004) -> pd.DataFra
     Detection: two asset_keys of the same class whose median price agrees within `tol`
     and whose tickers share a >=3-char prefix. Reported, never auto-merged.
     """
-    a = (snap[(snap["is_excluded"] == 0) & snap["last"].notna()]
+    # last > 0, not just notna: a venue reporting 0 makes the ratio below a divide
+    # by zero, and a zero-priced "match" is not evidence of a ticker collision.
+    a = (snap[(snap["is_excluded"] == 0) & (snap["last"] > 0)]
          .groupby(["asset_key", "asset_class"], as_index=False)
          .agg(px=("last", "median"), vol=("vol24h_usd", "sum"),
               venues=("venue", "nunique")))
@@ -207,12 +222,13 @@ def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
                                    if len(post) else np.nan),
             "days_since_onset": days_since_onset,
             "live_days": live_days,
-            "oi_usd_med30": g["oi_usd"].replace(0, np.nan).median(),
-            "oi_usd_mean30": g["oi_usd"].replace(0, np.nan).mean(),
+            "oi_usd_med30": _med(g["oi_usd"].replace(0, np.nan)),
+            "oi_usd_mean30": g["oi_usd"].replace(0, np.nan).dropna().mean()
+                             if g["oi_usd"].replace(0, np.nan).notna().any() else np.nan,
             "oi_days": int(g["oi_usd"].replace(0, np.nan).notna().sum()),
             "oi_trend": (g["oi_usd"].tail(7).median()
                          / g["oi_usd"].median()) if g["oi_usd"].median() else np.nan,
-            "trades_med30": g["trades"].replace(0, np.nan).median(),
+            "trades_med30": _med(g["trades"].replace(0, np.nan)),
             "n_venues": int(g["n_venues"].max()),
             "rv_bps_med": g["hl_bps"].median(),
             "px_spread_bps_med": g["px_spread_bps"].median(),
@@ -321,7 +337,7 @@ def venue_metrics(deep: pd.DataFrame, snap: pd.DataFrame, spec: pd.DataFrame,
         oi_usd_med30=("oi_usd", "median"),
         oi_days=("oi_usd", lambda x: int(x.notna().sum())),
         trades_med30=("trades", "median"),
-        fund_bps_med=("funding_sum", lambda x: x.median() * 1e4),
+        fund_bps_med=("funding_sum", lambda x: _med(x) * 1e4),
         fund_iv_h=("funding_interval_h", "median"),
         px_close=("px_close", "last"),
         days=("date", "nunique"))

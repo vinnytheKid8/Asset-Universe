@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -28,6 +29,7 @@ from build_report import DEFAULTS, score            # noqa: E402
 
 HERE = Path(__file__).parent
 STATIC = HERE / "static"
+LOGS = HERE.parent / "logs"
 DB = ch_schema.DB
 
 app = FastAPI(title="Universe calibration")
@@ -382,6 +384,135 @@ def history(new_days: int = 30):
     return JSONResponse({"dropped": jsonable(dropped), "active": jsonable(active),
                          "new": jsonable(new), "upcoming": jsonable(upcoming),
                          "gaps": jsonable(gaps)})
+
+
+@app.get("/api/logs")
+def logs(name: str | None = None, tail: int = 500):
+    """Pipeline logs off disk, newest first, plus one file's tail.
+
+    Reads only `logs/` next to the checkout, and resolves the requested name inside
+    it before opening: `name` arrives from the query string, so without the
+    containment check `?name=../../etc/passwd` would be served happily.
+    """
+    if not LOGS.is_dir():
+        return {"files": [], "name": None, "text": f"no log directory at {LOGS}",
+                "runs": []}
+    files = sorted((p for p in LOGS.glob("*.log") if p.is_file()),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    listing = [{
+        "name": p.name,
+        "kb": round(p.stat().st_size / 1024, 1),
+        "mtime": datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
+                         .isoformat(timespec="seconds").replace("+00:00", "Z"),
+    } for p in files[:80]]
+
+    pick = None
+    if name:
+        cand = (LOGS / name).resolve()
+        if cand.parent != LOGS.resolve() or not cand.is_file():
+            raise HTTPException(400, f"unknown log file: {name}")
+        pick = cand
+    elif files:
+        pick = files[0]
+
+    text = ""
+    if pick is not None:
+        n = max(1, min(int(tail), 20000))
+        # Whole-file read then slice: these cap out around a few hundred KB after the
+        # 30-day prune, so seeking backwards would be complexity for no gain.
+        lines = pick.read_text(errors="replace").splitlines()
+        text = "\n".join(lines[-n:])
+        if len(lines) > n:
+            text = f"… {len(lines) - n} earlier lines trimmed …\n" + text
+
+    runs = q(f"""SELECT run_ts, table, rows_loaded, rows_rejected, status, notes
+                 FROM {DB}.load_runs ORDER BY run_ts DESC LIMIT 40""")
+    return {"files": listing, "name": pick.name if pick is not None else None,
+            "text": text, "runs": jsonable(runs)}
+
+
+@app.get("/api/summary")
+def summary(run_date: str | None = None):
+    """The tradeable landscape, split by what we trade and what we don't.
+
+    Breadth comes from `venue_snapshot` (~9,800 instruments, every venue and market
+    type, the only place inverse perps exist at all); change/trend comes from
+    `screen_runs` over the 30-day history. Mixing them is deliberate: the snapshot
+    knows how big the market is, the history knows which way it is moving.
+    """
+    sr_where = (f"run_date = '{run_date}'" if run_date
+                else f"run_date = (SELECT max(run_date) FROM {DB}.screen_runs)")
+    vs_max = f"(SELECT max(run_date) FROM {DB}.venue_snapshot)"
+    vs_where = (f"run_date = '{run_date}'" if run_date else f"run_date = {vs_max}")
+    # Excluded instruments are out of every aggregate: dated futures, leveraged
+    # tokens, and Bitget rStocks whose reported volume is not platform volume.
+    live = f"{vs_where} AND is_excluded = 0"
+
+    # "we trade it" from internal_map, not screen_runs.traded: screen_runs only holds
+    # the ~130 shortlisted assets, so using it would label all 2,700 others "not
+    # traded" when the truth is "not screened".
+    ours = (f"(SELECT DISTINCT asset_key FROM {DB}.internal_map "
+            f"WHERE run_date = (SELECT max(run_date) FROM {DB}.internal_map) "
+            f"AND asset_key != '')")
+
+    by_market = q(f"""
+        SELECT kind, count() AS instruments, uniqExact(asset_key) AS assets,
+               sum(vol24h_usd) AS vol24h, sum(oi_usd) AS oi,
+               sumIf(vol24h_usd, asset_key IN {ours}) AS vol24h_ours,
+               uniqExactIf(asset_key, asset_key IN {ours}) AS assets_ours
+        FROM {DB}.venue_snapshot WHERE {live}
+        GROUP BY kind ORDER BY vol24h DESC""")
+
+    by_venue = q(f"""
+        SELECT venue, kind, sum(vol24h_usd) AS vol24h, sum(oi_usd) AS oi,
+               count() AS instruments,
+               sumIf(vol24h_usd, asset_key IN {ours}) AS vol24h_ours
+        FROM {DB}.venue_snapshot WHERE {live}
+        GROUP BY venue, kind ORDER BY venue, kind""")
+
+    by_class = q(f"""
+        SELECT asset_class, count() AS instruments, uniqExact(asset_key) AS assets,
+               sum(vol24h_usd) AS vol24h, sum(oi_usd) AS oi,
+               uniqExactIf(asset_key, asset_key IN {ours}) AS assets_ours,
+               sumIf(vol24h_usd, asset_key IN {ours}) AS vol24h_ours
+        FROM {DB}.venue_snapshot WHERE {live}
+        GROUP BY asset_class ORDER BY vol24h DESC""")
+
+    # Funding: only perps have it, and the spread across venues is the tradeable part
+    funding = q(f"""
+        SELECT asset_key, avg(funding_rate) * 100 AS fr_pct,
+               (max(funding_rate) - min(funding_rate)) * 1e4 AS spread_bps,
+               count() AS venues, sum(vol24h_usd) AS vol24h,
+               asset_key IN {ours} AS ours
+        FROM {DB}.venue_snapshot
+        WHERE {live} AND kind != 'spot' AND funding_rate IS NOT NULL
+        GROUP BY asset_key HAVING venues >= 2 AND vol24h > 1e6
+        ORDER BY abs(spread_bps) DESC LIMIT 25""")
+
+    # Verdict x traded, for the headline tiles
+    verdicts = q(f"""SELECT verdict, traded, count() AS n, sum(vol_usd_med30) AS adv
+                     FROM {DB}.screen_runs WHERE {sr_where}
+                     GROUP BY verdict, traded""")
+
+    # Movers, from the promoted band: distance off the 14d peak with the age of that
+    # peak, and the calendar-neutral same-weekday ratio. NOT vol_trend or a 30d slope
+    # - both are level ratios that stay high for weeks after a pump (FRAMEWORK.md 3.0).
+    movers = q(f"""SELECT asset_key, asset_class, traded, verdict,
+                     vol_usd_med30, vol_off_peak, vol_peak_age, vol_dow7, vol_d1,
+                     oi_usd_med30, oi_trend, fund_spread_bps_med, n_venues, composite
+                   FROM {DB}.screen_runs WHERE {sr_where}""")
+
+    return {
+        "run_date": (str(movers["asset_key"].size and run_date) if run_date
+                     else (q(f"SELECT max(run_date) AS d FROM {DB}.screen_runs")
+                           ["d"].astype(str).iloc[0])),
+        "by_market": jsonable(by_market),
+        "by_venue": jsonable(by_venue),
+        "by_class": jsonable(by_class),
+        "funding": jsonable(funding),
+        "verdicts": jsonable(verdicts),
+        "movers": jsonable(movers),
+    }
 
 
 @app.get("/api/query")

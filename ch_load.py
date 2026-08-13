@@ -416,6 +416,21 @@ def main() -> int:
     vm.insert(0, "run_date", run_date)
     ldr.load(vm, "screen_runs_venue", replace_key="run_date")
 
+    # ---- venue-wide snapshot ------------------------------------------------ #
+    # The whole tradeable landscape, not just the shortlist: ~9,800 instruments with
+    # 24h volume, OI, funding and spread. The pipeline already fetches this every
+    # night to BUILD the shortlist and used to throw it away, which left inverse
+    # perps and the ~9,700 unshortlisted instruments invisible to every query.
+    # instrument_daily stays the source for history; this is the breadth.
+    try:
+        snap = read("snapshot")
+        snap.insert(0, "run_date", run_date)
+        snap["kind"] = snap["kind"].fillna("")
+        snap["ingest_ts"] = run_ts
+        ldr.load(snap, "venue_snapshot", replace_key="run_date")
+    except (KeyError, FileNotFoundError, OSError):
+        log.warning("snapshot absent, skipping venue_snapshot")
+
     for fname, table in (("dup_tickers", "screen_dup_tickers"),
                          ("internal_map", "internal_map")):
         try:
@@ -427,7 +442,8 @@ def main() -> int:
         ldr.load(df, table, replace_key="run_date")
 
     ldr.optimize(["instrument_ref", "instrument_daily", "screen_runs",
-                  "screen_runs_venue", "screen_dup_tickers", "internal_map"])
+                  "screen_runs_venue", "screen_dup_tickers", "internal_map",
+                  "venue_snapshot"])
     ldr.flush_audit()
 
     if a.dry_run:

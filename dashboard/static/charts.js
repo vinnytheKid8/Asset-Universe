@@ -235,9 +235,22 @@ export function scatter(host, pts, opt = {}) {
     f.plot.appendChild(c);
   });
 
-  // label only the extremes, never every point
+  // Label selectively, never every point. `labelSet` names the points that must be
+  // labelled whatever their position (the drops, the top adds) - being off in a
+  // corner is exactly when you most need to know which asset it is. labelTop then
+  // fills in the extremes, skipping anything already named.
+  const named = new Set();
+  if (opt.labelSet) {
+    good.filter(p => opt.labelSet.has(p.label)).forEach(p => {
+      named.add(p.label);
+      const t = el('text', { x: f.tx(p.x) + 8, y: f.ty(p.y) + 4,
+                             class: 'ptlabel' + (opt.labelClass ? ' ' + opt.labelClass(p) : '') });
+      t.textContent = p.label; f.plot.appendChild(t);
+    });
+  }
   if (opt.labelTop) {
-    [...good].sort((a, b) => (b.x * b.y) - (a.x * a.y)).slice(0, opt.labelTop).forEach(p => {
+    [...good].filter(p => !named.has(p.label))
+      .sort((a, b) => (b.x * b.y) - (a.x * a.y)).slice(0, opt.labelTop).forEach(p => {
       const t = el('text', { x: f.tx(p.x) + 8, y: f.ty(p.y) + 4, class: 'ptlabel' });
       t.textContent = p.label; f.plot.appendChild(t);
     });

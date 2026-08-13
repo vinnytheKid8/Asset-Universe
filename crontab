@@ -6,10 +6,15 @@
 # Verify:  crontab -l
 # Remove:  crontab -r
 #
-# Schedule is LOCAL time (America/New_York, UTC-4/-5). 04:00 local = 08:00 UTC in
-# summer, 09:00 in winter. Both are safely past the ~02:00 UTC floor at which all
-# five venues have settled the previous UTC day (OKX and Bitget close their native
-# day at 16:00 UTC - see PIPELINE.md 2.1), so DST cannot break it.
+# Schedule is LOCAL time. Runs on vision, which is Etc/UTC, so 04:00 local IS
+# 04:00 UTC and there is no DST to reason about. That clears the ~02:00 UTC floor at
+# which all five venues have settled the previous UTC day (OKX and Bitget close
+# their native day at 16:00 UTC - see PIPELINE.md 2.1) by two hours.
+#
+# Two hours is the thinnest margin this has run on: on Bruce (America/New_York) the
+# same 04:00 line meant 08:00-09:00 UTC, six hours clear. If a late-arriving daily
+# bar ever shows up as a short last day, move this later rather than earlier - the
+# floor is a floor, not a target.
 #
 # Stages: run_screen.py (REST pull, ~25 min with spot) -> ch_load.py
 #         -> history.py -> build_report.py

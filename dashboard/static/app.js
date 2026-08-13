@@ -1,4 +1,4 @@
-import { timeSeries, scatter, fmtUsd, fmtNum } from '/static/charts.js';
+import { timeSeries, scatter, hbar, fmtUsd, fmtNum } from '/static/charts.js';
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -14,7 +14,15 @@ const showErr = e => { $('#err').innerHTML = `<div class="err">${e.message || e}
 
 const S = { meta: null, screen: null, venues: null, health: null, params: {},
             vfilter: new Set(['keep', 'add', 'watch', 'drop']), movedOnly: false,
-            detail: null, pending: null, sort: {}, mktFilter: '' };
+            tfilter: 'all', detail: null, pending: null, sort: {}, mktFilter: '',
+            summary: null, sfilter: 'all', logs: null };
+
+// Verdicts in decision order - what we are dropping first, what we could add next,
+// then the maybes, then the steady state. Not alphabetical, not by count.
+const VORDER = ['drop', 'add', 'watch', 'keep'];
+// Does this row survive a traded / not-traded chip? Shared by the screen and the
+// summary so the two tabs can never disagree about what "we trade it" means.
+const tradedOk = (r, f) => f === 'all' || (f === 'ours' ? !!r.traded : !r.traded);
 
 const VCOL = { keep: 'var(--keep)', add: 'var(--add)', watch: 'var(--watch)', drop: 'var(--drop)' };
 const pct1 = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
@@ -142,7 +150,8 @@ function fillAxisSelects() {
 }
 
 function screenRows() {
-  return S.screen.rows.filter(r => S.vfilter.has(r.verdict) && (!S.movedOnly || r.moved));
+  return S.screen.rows.filter(r => S.vfilter.has(r.verdict)
+    && (!S.movedOnly || r.moved) && tradedOk(r, S.tfilter));
 }
 
 function drawScatter() {
@@ -157,14 +166,24 @@ function drawScatter() {
                   n_venues: S.params.g_venues ?? S.meta.defaults.g_venues,
                   days_above_5m: S.params.g_persist ?? S.meta.defaults.g_persist,
                   composite: S.screen.add_bar };
+  // Label every drop and the 10 strongest adds by name. These are the marks you act
+  // on, and "which one is that?" is exactly the question a position-ranked label
+  // list fails to answer for an outlier sitting alone in a corner.
+  const labelSet = new Set([
+    ...rows.filter(r => r.verdict === 'drop').map(r => r.asset_key),
+    ...rows.filter(r => r.verdict === 'add')
+           .sort((a, b) => (b.composite || 0) - (a.composite || 0))
+           .slice(0, 10).map(r => r.asset_key),
+  ]);
   scatter($('#scatter'), pts, {
+    labelSet, labelClass: p => p.group === 'drop' ? 'lbl-drop' : 'lbl-add',
     xlog: $('#sxlog').checked, ylog: $('#sylog').checked, height: 430,
     xfmt: v => AXES.find(a => a[0] === xk)[1].includes('USD') ? fmtUsd(v) : fmtNum(v, v < 10 ? 2 : 0),
     yfmt: v => AXES.find(a => a[0] === yk)[1].includes('USD') ? fmtUsd(v) : fmtNum(v, v < 10 ? 2 : 0),
     groupColor: g => VCOL[g] || 'var(--muted)',
     vlines: gates[xk] != null ? [{ x: gates[xk], label: 'gate' }] : [],
     hlines: gates[yk] != null ? [{ y: gates[yk], label: 'gate' }] : [],
-    labelTop: 8,
+    labelTop: 4,
     onClick: p => openDetail(p.label),
     tip: p => {
       const r = p.meta, g = (ok, s) => `<span class="${ok ? 'pass' : 'fail'}">${ok ? '✓' : '✗'} ${s}</span>`;
@@ -182,7 +201,9 @@ function drawScatter() {
           ${g(r.gate_venues, 'venues')} ${g(r.gate_oi, 'OI')}</div>`;
     },
   });
-  $('#scatter-sub').textContent = `${rows.length} of ${S.screen.rows.length} assets`;
+  const nd = rows.filter(r => r.verdict === 'drop').length;
+  $('#scatter-sub').textContent = `${rows.length} of ${S.screen.rows.length} assets`
+    + (nd ? ` · ${nd} drop${nd > 1 ? 's' : ''} and the top adds are named` : '');
 }
 
 const why = r => {
@@ -262,7 +283,11 @@ function drawScreenTable() {
   const q = $('#q-screen').value.toLowerCase();
   const rows = screenRows().filter(r => !q || r.asset_key.toLowerCase().includes(q));
   setThruMax(rows);
-  renderTable($('#t-screen'), rows, SCREEN_COLS, r => openDetail(r.asset_key), 't-screen');
+  // Grouped by verdict unless the user has picked a sort column - a decision list is
+  // read one verdict at a time ("what am I dropping"), but an explicit sort is a
+  // request to see the whole set ordered that way, and group headers would break it.
+  renderTable($('#t-screen'), rows, SCREEN_COLS, r => openDetail(r.asset_key), 't-screen',
+              S.sort['t-screen'] ? null : r => r.verdict);
 }
 
 /* ===================== generic table ===================== */
@@ -335,10 +360,15 @@ function cell(r, key, kind) {
   }
 }
 
-function renderTable(tbl, rows, cols, onClick, sortId) {
+function renderTable(tbl, rows, cols, onClick, sortId, groupBy) {
   const sid = sortId || tbl.id;
   const st = S.sort[sid];
   let data = rows;
+  if (groupBy && !st) {
+    const rank = v => { const i = VORDER.indexOf(v); return i < 0 ? VORDER.length : i; };
+    data = [...rows].sort((a, b) => rank(groupBy(a)) - rank(groupBy(b))
+                                 || (b.composite || 0) - (a.composite || 0));
+  }
   if (st) {
     const k = st.key;
     data = [...rows].sort((a, b) => {
@@ -353,18 +383,29 @@ function renderTable(tbl, rows, cols, onClick, sortId) {
   const head = cols.map(([k, l, kind, cls]) =>
     `<th class="${kind && !'tkv'.includes(kind) ? 'num' : ''} ${cls || ''} ${st && st.key === k ? 'sorted' + (st.asc ? ' asc' : '') : ''}"
         data-k="${k}">${l}</th>`).join('');
+  let seen = null;
   const body = data.map(r => {
     const tds = cols.map(([k, , kind, cls]) => {
       const c = cell(r, k, kind);
       return `<td class="${c.cls} ${cls || ''}">${c.html}</td>`;
     }).join('');
-    return `<tr class="${r.moved ? 'moved' : ''}" data-a="${r.asset_key || ''}">${tds}</tr>`;
+    let head = '';
+    if (groupBy && !st) {
+      const g = groupBy(r);
+      if (g !== seen) {
+        seen = g;
+        const n = data.filter(x => groupBy(x) === g).length;
+        head = `<tr class="grouphead v-${g}"><td colspan="${cols.length}">`
+             + `${g} <span class="gn">${n}</span></td></tr>`;
+      }
+    }
+    return head + `<tr class="${r.moved ? 'moved' : ''}" data-a="${r.asset_key || ''}">${tds}</tr>`;
   }).join('');
   tbl.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
   tbl.querySelectorAll('th').forEach(th => th.onclick = () => {
     const k = th.dataset.k;
     S.sort[sid] = { key: k, asc: S.sort[sid] && S.sort[sid].key === k ? !S.sort[sid].asc : false };
-    renderTable(tbl, rows, cols, onClick, sid);
+    renderTable(tbl, rows, cols, onClick, sid, groupBy);
   });
   if (onClick) tbl.querySelectorAll('tbody tr').forEach(tr => {
     tr.style.cursor = 'pointer';
@@ -825,6 +866,147 @@ async function runSql() {
 }
 
 /* ===================== shell ===================== */
+/* ===================== summary ===================== */
+const MKT = { linear_perp: 'perp', spot: 'spot', inverse_perp: 'inv perp' };
+const MCOL = { linear_perp: 'var(--s1)', spot: 'var(--s3)', inverse_perp: 'var(--s7)' };
+
+// Pick total vs our-share vs their-share off one row, so every panel on the tab
+// answers the same chip the same way.
+function pick(r, base) {
+  const tot = +r[base] || 0, ours = +r[base + '_ours'] || 0;
+  return S.sfilter === 'ours' ? ours : S.sfilter === 'not' ? tot - ours : tot;
+}
+
+async function loadSummary() {
+  try {
+    S.summary = await api('/api/summary', { run_date: $('#run-date').value || null });
+    drawSummary();
+  } catch (e) { showErr(e); }
+}
+
+function drawSummary() {
+  const d = S.summary;
+  if (!d) return;
+  const mv = d.movers.filter(r => tradedOk(r, S.sfilter));
+
+  /* ---- headline tiles: magnitudes, so numbers not charts ---- */
+  const mk = Object.fromEntries(d.by_market.map(r => [r.kind, r]));
+  const t = (k, v, sub) => `<div class="t"><div class="k">${k}</div>`
+    + `<div class="v">${v}</div><div class="s">${sub || '&nbsp;'}</div></div>`;
+  const row = k => mk[k] || {};
+  const oiTot = d.by_market.reduce((a, r) => a + (+r.oi || 0), 0);
+  $('#sum-tiles').className = 'tile-g';
+  $('#sum-tiles').innerHTML =
+      t('perp 24h', fmtUsd(pick(row('linear_perp'), 'vol24h')),
+        `${row('linear_perp').instruments || 0} instruments · ${row('linear_perp').assets || 0} assets`)
+    + t('spot 24h', fmtUsd(pick(row('spot'), 'vol24h')),
+        `${row('spot').instruments || 0} instruments · ${row('spot').assets || 0} assets`)
+    + t('inverse perp 24h', fmtUsd(pick(row('inverse_perp'), 'vol24h')),
+        `${row('inverse_perp').instruments || 0} instruments`)
+    + t('open interest', fmtUsd(oiTot), 'perp + inverse, all venues')
+    + t('screened', `${mv.length}`, `of ${d.movers.length} scored this run`)
+    + t('we quote', `${d.movers.filter(r => r.traded).length}`,
+        `${d.by_market.reduce((a, r) => Math.max(a, +r.assets_ours || 0), 0)} assets have a leg somewhere`);
+
+  /* ---- venue x market ---- */
+  const vr = [];
+  for (const r of d.by_venue) {
+    const v = pick(r, 'vol24h');
+    if (v > 0) vr.push({ label: `${r.venue} ${MKT[r.kind] || r.kind}`, value: v, group: r.kind });
+  }
+  vr.sort((a, b) => b.value - a.value);
+  hbar($('#sum-venue'), vr, { groupColor: g => MCOL[g] || 'var(--muted)', fmt: fmtUsd });
+
+  /* ---- asset class ---- */
+  const cr = d.by_class.map(r => ({ label: r.asset_class, value: pick(r, 'vol24h'),
+                                    group: r.asset_class, meta: r }))
+    .filter(r => r.value > 0).sort((a, b) => b.value - a.value);
+  hbar($('#sum-class'), cr, { fmt: fmtUsd,
+    groupColor: g => g === 'crypto' ? 'var(--s1)' : g === 'equity' ? 'var(--s2)'
+                   : g === 'commodity' ? 'var(--s4)' : 'var(--s5)' });
+  const eq = d.by_class.find(r => r.asset_class === 'equity');
+  $('#sum-class-note').textContent = eq
+    ? `${eq.assets} equity assets across ${eq.instruments} instruments; we quote ${eq.assets_ours}.`
+    : '';
+
+  /* ---- rolling over / waking up ---- */
+  const fade = mv.filter(r => r.vol_off_peak != null && r.vol_usd_med30 > 1e6)
+    .sort((a, b) => a.vol_off_peak - b.vol_off_peak).slice(0, 25);
+  renderTable($('#t-sum-fade'), fade, [
+    ['asset_key', 'Asset', 'k'], ['verdict', 'Verdict', 'v'],
+    ['vol_off_peak', 'vs 14d peak', 'chg'], ['vol_peak_age', 'Peak age', 'age'],
+    ['vol_usd_med30', 'ADV med', 'usd'], ['traded', 'Ours', 'b'],
+  ], r => openDetail(r.asset_key), 't-sum-fade');
+
+  const wake = mv.filter(r => r.vol_dow7 != null && r.vol_usd_med30 > 1e6)
+    .sort((a, b) => b.vol_dow7 - a.vol_dow7).slice(0, 25);
+  renderTable($('#t-sum-wake'), wake, [
+    ['asset_key', 'Asset', 'k'], ['verdict', 'Verdict', 'v'],
+    ['vol_dow7', 'vs same wkday', 'chg'], ['vol_off_peak', 'vs 14d peak', 'chg'],
+    ['vol_usd_med30', 'ADV med', 'usd'], ['traded', 'Ours', 'b'],
+  ], r => openDetail(r.asset_key), 't-sum-wake');
+
+  /* ---- OI trend ---- */
+  const oi = mv.filter(r => r.oi_trend != null && r.oi_usd_med30 > 1e6)
+    .sort((a, b) => Math.abs(b.oi_trend - 1) - Math.abs(a.oi_trend - 1)).slice(0, 16)
+    .map(r => ({ label: r.asset_key, value: (r.oi_trend - 1) * 100, group: r.oi_trend >= 1 ? 'up' : 'dn',
+                 meta: r }));
+  hbar($('#sum-oi'), oi, { fmt: v => `${v >= 0 ? '+' : ''}${fmtNum(v, 0)}%`,
+    groupColor: g => g === 'up' ? 'var(--s3)' : 'var(--s2)',
+    onClick: r => openDetail(r.label) });
+
+  /* ---- funding dispersion ---- */
+  const fd = d.funding.filter(r => S.sfilter === 'all' ? true
+                                 : S.sfilter === 'ours' ? r.ours : !r.ours)
+    .slice(0, 16)
+    .map(r => ({ label: r.asset_key, value: r.spread_bps, group: r.ours ? 'ours' : 'not' }));
+  hbar($('#sum-funding'), fd, { fmt: v => `${fmtNum(v, 1)} bps`,
+    groupColor: g => g === 'ours' ? 'var(--s1)' : 'var(--s5)',
+    onClick: r => openDetail(r.label) });
+
+  $('#sum-sub').textContent = `run ${d.run_date} · `
+    + (S.sfilter === 'all' ? 'whole universe'
+       : S.sfilter === 'ours' ? 'assets we quote' : 'assets we do not quote');
+}
+
+/* ===================== logs ===================== */
+const LOGRE = /(WARNING|ERROR|FATAL|Traceback|CRITICAL)/;
+
+async function loadLogs(name) {
+  try {
+    S.logs = await api('/api/logs', { name: name || null, tail: +$('#log-tail').value });
+    const sel = $('#log-file');
+    sel.innerHTML = S.logs.files
+      .map(f => `<option${f.name === S.logs.name ? ' selected' : ''}>${f.name}</option>`).join('');
+    drawLogs();
+  } catch (e) { showErr(e); }
+}
+
+function drawLogs() {
+  const d = S.logs;
+  if (!d) return;
+  const only = $('#log-warn').checked;
+  const esc = t => t.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  let lines = (d.text || '').split('\n');
+  if (only) lines = lines.filter(l => LOGRE.test(l));
+  // Severity gets a class as well as its word - colour is never the only carrier.
+  $('#log-text').innerHTML = lines.map(l => {
+    const e = esc(l);
+    if (/ERROR|FATAL|Traceback|CRITICAL/.test(l)) return `<span class="le">${e}</span>`;
+    if (/WARNING/.test(l)) return `<span class="lw">${e}</span>`;
+    if (/\bdone\b|=== /.test(l)) return `<span class="lok">${e}</span>`;
+    return e;
+  }).join('\n') || '<span class="empty">nothing matches</span>';
+  const f = d.files.find(x => x.name === d.name);
+  $('#logs-sub').textContent = d.name
+    ? `${d.name} · ${f ? f.kb + ' KB · ' + f.mtime : ''}${only ? ' · filtered' : ''}`
+    : 'no log files yet';
+  renderTable($('#t-logruns'), d.runs, [
+    ['run_ts', 'Run', 'k'], ['table', 'Table', 'k'], ['rows_loaded', 'Rows', 'n0'],
+    ['rows_rejected', 'Rejected', 'n0'], ['status', 'Status', 'k'], ['notes', 'Notes', 'k'],
+  ], null, 't-logruns');
+}
+
 function switchView(v) {
   $$('nav button[data-v]').forEach(b => b.classList.toggle('on', b.dataset.v === v));
   $$('.view').forEach(s => s.classList.toggle('on', s.id === 'v-' + v));
@@ -838,6 +1020,8 @@ function switchView(v) {
   if (v === 'history') {
     if (!S.history) loadHistory(); else drawHistory();
   }
+  if (v === 'summary') { if (!S.summary) loadSummary(); else drawSummary(); }
+  if (v === 'logs') { if (!S.logs) loadLogs(); else drawLogs(); }
 }
 
 async function loadHistory() {
@@ -868,6 +1052,7 @@ async function init() {
     const deep = qp.get('asset');
     if (deep && S.screen.rows.some(r => r.asset_key === deep)) openDetail(deep);
     else if (location.hash) switchView(location.hash.slice(1));
+    else loadSummary();   // summary is the landing tab
   } catch (e) { showErr(e); }
 }
 
@@ -878,6 +1063,7 @@ $('#theme').onclick = () => {
   next ? document.documentElement.setAttribute('data-theme', next)
        : document.documentElement.removeAttribute('data-theme');
   if (S.screen) { drawScatter(); if (S.detail) drawDetail(); if (S.health) drawHealth(); }
+  if (S.summary) drawSummary();
 };
 $('#reset').onclick = () => { S.params = {}; buildKnobs(); loadScreen(); };
 $('#copylink').onclick = () => {
@@ -886,7 +1072,7 @@ $('#copylink').onclick = () => {
   navigator.clipboard.writeText(u.toString());
   $('#copylink').textContent = 'copied'; setTimeout(() => $('#copylink').textContent = 'Link', 1200);
 };
-$('#run-date').onchange = loadScreen;
+$('#run-date').onchange = () => { loadScreen(); if (S.summary) loadSummary(); };
 ['#sx', '#sy', '#sxlog', '#sylog'].forEach(s => $(s).onchange = drawScatter);
 $$('.chip[data-vf]').forEach(c => c.onclick = () => {
   c.classList.toggle('on');
@@ -894,6 +1080,20 @@ $$('.chip[data-vf]').forEach(c => c.onclick = () => {
   drawScatter(); drawScreenTable();
 });
 $('#movedonly').onchange = e => { S.movedOnly = e.target.checked; drawScatter(); drawScreenTable(); };
+// traded / not-traded is single-select: these are three views of one axis, not four
+// independent toggles like the verdict chips above them.
+$$('.chip[data-tf]').forEach(c => c.onclick = () => {
+  $$('.chip[data-tf]').forEach(o => o.classList.toggle('on', o === c));
+  S.tfilter = c.dataset.tf; drawScatter(); drawScreenTable();
+});
+$$('.chip[data-sf]').forEach(c => c.onclick = () => {
+  $$('.chip[data-sf]').forEach(o => o.classList.toggle('on', o === c));
+  S.sfilter = c.dataset.sf; drawSummary();
+});
+$('#log-file').onchange = e => loadLogs(e.target.value);
+$('#log-tail').onchange = () => loadLogs($('#log-file').value);
+$('#log-refresh').onclick = () => loadLogs($('#log-file').value);
+$('#log-warn').onchange = drawLogs;
 $('#q-screen').oninput = drawScreenTable;
 $('#csv-screen').onclick = () => toCsv($('#t-screen'), 'screen.csv');
 ['#q-assets', '#f-class', '#f-traded'].forEach(s => $(s).oninput = drawAssets);

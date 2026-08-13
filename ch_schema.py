@@ -165,6 +165,13 @@ CREATE TABLE IF NOT EXISTS {DB}.screen_runs
     new_listing     UInt8,
     tick_pinned     UInt8,
     decaying        UInt8,
+    -- WHICH decay path fired, not just that one did. decay_slow is the 7d/30d level
+    -- ratio + 30d slope rule; decay_fast is the off-peak rule (FRAMEWORK.md 3.0),
+    -- which ships disabled. Without these, an asset reads "decaying" with no way to
+    -- tell whether it faded slowly or fell off a cliff - and they were being dropped
+    -- at load with a warning on every single run.
+    decay_slow      UInt8,
+    decay_fast      UInt8,
     days            Float64,
     vol_usd_med30   Float64,
     vol_usd_mean30  Float64,
@@ -463,8 +470,41 @@ WHERE market_type != 'spot'
 GROUP BY date, asset_key
 """
 
+VENUE_SNAPSHOT = f"""
+CREATE TABLE IF NOT EXISTS {DB}.venue_snapshot
+(
+    run_date        Date,
+    venue           LowCardinality(String),
+    symbol          String,
+    kind            LowCardinality(String),   -- linear_perp | inverse_perp | spot
+    quote           LowCardinality(String),
+    asset_key       LowCardinality(String),
+    asset_class     LowCardinality(String),
+    equity_region   LowCardinality(String),
+    is_rwa          UInt8,
+    inverse         UInt8,
+    active          UInt8,
+    is_excluded     UInt8,
+    last            Nullable(Float64),
+    vol24h_usd      Float64,
+    oi_usd          Nullable(Float64),
+    trades24h       Nullable(Float64),
+    funding_rate    Nullable(Float64),
+    funding_interval_h Nullable(Float64),
+    spread_bps      Nullable(Float64),
+    tick_bps        Nullable(Float64),
+    ingest_ts       DateTime('UTC')
+)
+ENGINE = ReplacingMergeTree(ingest_ts)
+PARTITION BY toYYYYMM(run_date)
+-- kind is load-bearing: BIN lists BTCUSDT as both spot and perp, and 2,578 rows
+-- collide on (venue, symbol) alone.
+ORDER BY (run_date, venue, symbol, kind)
+"""
+
 TABLES = {
     "instrument_ref": INSTRUMENT_REF,
+    "venue_snapshot": VENUE_SNAPSHOT,
     "instrument_daily": INSTRUMENT_DAILY,
     "screen_runs": SCREEN_RUNS,
     "screen_runs_venue": SCREEN_RUNS_VENUE,
@@ -480,6 +520,7 @@ VIEWS = {"asset_daily": ASSET_DAILY, "asset_listing_matrix": ASSET_LISTING_MATRI
 # (table, key columns) - checked after every load. See the module docstring.
 DEDUP_KEYS = {
     "instrument_ref": ["venue", "symbol", "kind"],
+    "venue_snapshot": ["run_date", "venue", "symbol", "kind"],
     "instrument_daily": ["venue", "symbol", "market_type", "date"],
     "screen_runs": ["asset_key", "run_date"],
     "screen_runs_venue": ["asset_key", "venue", "symbol", "market_type", "run_date"],

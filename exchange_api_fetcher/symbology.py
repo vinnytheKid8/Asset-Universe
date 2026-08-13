@@ -59,6 +59,26 @@ ISSUER_SUFFIXES = {
     ("GAT", "spot"): ("ON", "X", "G"),
     ("GAT", "linear_perp"): ("X",),
 }
+# OKX puts the wrapper on the FRONT: XAAPL, XNVDA, XTSLA, XGOOGL - 63 of them, all
+# reading as `crypto` under their wrapped ticker until this existed. Same idea as
+# ISSUER_SUFFIXES, opposite end of the string.
+ISSUER_PREFIXES = {
+    ("OKX", "spot"): ("X",),
+    ("OKX", "linear_perp"): ("X",),
+}
+# Bitget "rStocks" - tokenised equities under an R prefix. EXCLUDED, not merged.
+#
+# Bitget's API reports quoteVolume / baseVolume / usdtVolume that all agree with each
+# other on figures like $4.2B/day for RSPYUSDT, while Bitget's own UI shows a tiny
+# 24h spot volume for the same pair and states that as the platform figure. Whatever
+# the API number aggregates, it is not volume anyone could quote against - and it is
+# 99% of Bitget's reported spot book ($529.7B of $534.7B). The endpoint publishes no
+# alternative volume field, so these instruments are dropped rather than believed.
+# Excluding them puts BGT spot at $4.98B, next to BIN's $5.02B.
+#
+# The `not declared COIN anywhere` guard is what keeps the 18 real R-tokens - RAY,
+# RUNE, RENDER, ROSE, RSR, RVN, RLC, RONIN - in the universe.
+RSTOCK_PREFIXES = {("BGT", "spot"): "R"}
 
 
 def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
@@ -68,6 +88,13 @@ def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
     # --- RWA underlyings, from the two venues that declare it natively ------------
     rwa = set(df.loc[df["is_rwa"] == 1, "base_raw"].dropna().unique())
     all_bases = set(df["base_raw"].dropna().unique())
+    # Tokens a venue explicitly calls a COIN. Used only to VETO a prefix strip: a
+    # venue calling something a coin is the strongest available denial that it is a
+    # tokenised stock, and the `stem in rwa` guard alone is too weak at the front of
+    # the string. XPL (Plasma, COIN on all five venues) would otherwise strip to PL,
+    # which Bitget tags as generic RWA - merging Plasma into platinum.
+    declared_coin = set(df.loc[df["underlying_type"].astype(str).str.upper() == "COIN",
+                               "base_raw"].dropna().unique())
 
     keys, classes, issuers, scales, excl, reasons, conf = [], [], [], [], [], [], []
     regions = []
@@ -76,10 +103,14 @@ def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
         key, issuer, scale = b, "", 1.0
         ex, reason, cf = 0, "", "verified"
 
+        _rs = RSTOCK_PREFIXES.get((venue, kind))
         if kind in ("future", "inverse_future"):
             ex, reason = 1, "dated_future"
         elif LEVERAGED_RE.search(b):
             ex, reason = 1, "leveraged_token"
+        elif _rs and b.startswith(_rs) and len(b) > 2 and b not in declared_coin:
+            # See RSTOCK_PREFIXES: reported volume is not platform volume.
+            ex, reason = 1, "rstock_volume_unverifiable"
         else:
             # 1. scale prefix
             m = SCALE_RE.match(b)
@@ -88,12 +119,23 @@ def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
                 if rest in all_bases:
                     key, scale = rest, float(m.group(1).replace("1M", "1000000"))
                     cf = "proposed"          # needs the price-agreement check
-            # 2. RWA issuer wrapper
+            # 2. RWA issuer wrapper, suffix
             for suf in ISSUER_SUFFIXES.get((venue, kind), ()):
                 if key.endswith(suf) and len(key) > len(suf):
                     stem = key[: -len(suf)]
                     if stem in rwa:
                         key, issuer = stem, suf
+                        break
+            # 3. RWA issuer wrapper, prefix (OKX). Two guards, both load-bearing:
+            # the stem must be a known RWA underlying, AND the wrapped token must not
+            # be declared a COIN anywhere. Verified against the live universe: strips
+            # 63 tokenised equities, blocks all 16 real tickers that merely start with
+            # X - XRP, XAG, XAU, XAUT, XCH, XCU, XPT, XPD, XLM, XTZ, XIAOMI, XPL.
+            for pre in ISSUER_PREFIXES.get((venue, kind), ()):
+                if key.startswith(pre) and len(key) > len(pre):
+                    stem = key[len(pre):]
+                    if stem in rwa and key not in declared_coin:
+                        key, issuer = stem, pre
                         break
 
         ut = str(r.underlying_type or "").upper()

@@ -13,12 +13,14 @@
   <span class="sub" id="hdr-sub">loading…</span>
   <select id="run-date" title="screen run"></select>
   <nav>
-    <button data-v="screen" class="on">Screen</button>
+    <button data-v="summary" class="on">Summary</button>
+    <button data-v="screen">Screen</button>
     <button data-v="assets">Assets</button>
     <button data-v="detail">Asset detail</button>
     <button data-v="venues">Venues</button>
     <button data-v="history">Changes</button>
     <button data-v="health">Data health</button>
+    <button data-v="logs">Logs</button>
     <button data-v="sql">SQL</button>
     <button id="theme" title="light / dark">◑</button>
   </nav>
@@ -27,8 +29,67 @@
 <main>
 <div id="err"></div>
 
+<!-- ============================ SUMMARY ============================ -->
+<section class="view on" id="v-summary">
+  <div class="card">
+    <h2>The tradeable landscape <small id="sum-sub"></small></h2>
+    <div class="ctl">
+      <span class="chip on" data-sf="all">everything</span>
+      <span class="chip" data-sf="ours">we trade it</span>
+      <span class="chip" data-sf="not">we don't</span>
+      <span class="note" style="margin:0 0 0 auto">24h figures are the venue-wide
+        snapshot; changes are the 30-day history.</span>
+    </div>
+    <div class="tiles" id="sum-tiles"></div>
+  </div>
+
+  <div class="sum-grid">
+    <div class="card">
+      <h2>Volume by venue &amp; market <small>24h, USD</small></h2>
+      <div id="sum-venue"></div>
+      <div class="note">Inverse perps exist only here — the 30-day history covers
+        linear perps and spot only.</div>
+    </div>
+    <div class="card">
+      <h2>Volume by asset class <small>24h, USD</small></h2>
+      <div id="sum-class"></div>
+      <div class="note" id="sum-class-note"></div>
+    </div>
+  </div>
+
+  <div class="sum-grid">
+    <div class="card">
+      <h2>Rolling over <small>furthest below their own 14-day peak</small></h2>
+      <div class="tw" style="max-height:34vh"><table id="t-sum-fade"></table></div>
+      <div class="note">Measured from the high, not over a window — a window that
+        still contains the pump reads "up" for weeks after it ends.</div>
+    </div>
+    <div class="card">
+      <h2>Waking up <small>largest calendar-neutral weekly gain</small></h2>
+      <div class="tw" style="max-height:34vh"><table id="t-sum-wake"></table></div>
+      <div class="note">Versus the <i>same weekday</i> a week ago. RWA volume swings
+        20× between weekdays and weekends, so a raw 1-day change is mostly calendar.</div>
+    </div>
+  </div>
+
+  <div class="sum-grid">
+    <div class="card">
+      <h2>Open interest trend <small>7d / 30d median</small></h2>
+      <div id="sum-oi"></div>
+      <div class="note">Bitget publishes no OI history, so assets where BGT carries a
+        large share read low.</div>
+    </div>
+    <div class="card">
+      <h2>Funding dispersion <small>max − min across venues, bps</small></h2>
+      <div id="sum-funding"></div>
+      <div class="note">The spread across venues is the carry you could actually
+        capture; the level alone is not.</div>
+    </div>
+  </div>
+</section>
+
 <!-- ============================ SCREEN ============================ -->
-<section class="view on" id="v-screen">
+<section class="view" id="v-screen">
   <div class="calib">
     <div class="card knobs">
       <h2>Gates &amp; weights</h2>
@@ -57,6 +118,10 @@
           <span class="chip on add" data-vf="add">add</span>
           <span class="chip on watch" data-vf="watch">watch</span>
           <span class="chip on drop" data-vf="drop">drop</span>
+          <span class="sep"></span>
+          <span class="chip on" data-tf="all">all</span>
+          <span class="chip" data-tf="ours">we trade it</span>
+          <span class="chip" data-tf="not">we don't</span>
           <label><input type="checkbox" id="movedonly"> only movers</label>
         </div>
         <div class="chartbox" id="scatter"></div>
@@ -248,6 +313,26 @@ on a linear axis the whole pre-spike history flattens to nothing"><input type="c
 </section>
 
 <!-- ============================ SQL ============================ -->
+<!-- ============================ LOGS ============================ -->
+<section class="view" id="v-logs">
+  <div class="card">
+    <h2>Pipeline logs <small id="logs-sub"></small></h2>
+    <div class="ctl">
+      <label>file <select id="log-file"></select></label>
+      <label>tail <select id="log-tail">
+        <option>200</option><option selected>500</option>
+        <option>2000</option><option>20000</option></select></label>
+      <button class="btn ghost" id="log-refresh">Refresh</button>
+      <label><input type="checkbox" id="log-warn"> only WARNING / ERROR</label>
+    </div>
+    <pre id="log-text" class="logbox">loading…</pre>
+  </div>
+  <div class="card">
+    <h2>Load runs <small>did it run, was it clean</small></h2>
+    <div class="tw" style="max-height:40vh"><table id="t-logruns"></table></div>
+  </div>
+</section>
+
 <section class="view" id="v-sql">
   <div class="card">
     <h2>Ad-hoc query <small>read-only, capped at 5,000 rows</small></h2>
