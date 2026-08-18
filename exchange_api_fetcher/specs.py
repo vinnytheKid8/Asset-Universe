@@ -251,6 +251,12 @@ def fetch_all(venues=None) -> pd.DataFrame:
         except Exception as e:                                   # noqa: BLE001
             log.error("specs %s failed: %s", v, e)
     df = pd.DataFrame(rows)
+    # Keep the venue's own casing before folding to upper. Bitget encodes its
+    # tokenised-stock product in the CASE of baseCoin - rSPY, rNVDA, rV - and
+    # uppercasing first destroys the only exact signal for it, leaving symbology to
+    # guess from string length (which missed rA/rB/rC/rD/rF/rO/rT/rU/rV, ten symbols
+    # reporting $10.5B/day between them). derive_asset_keys reads this and drops it.
+    df["base_native"] = df["base_raw"].astype(str)
     df["base_raw"] = df["base_raw"].astype(str).str.upper()
     df["quote"] = df["quote"].astype(str).str.upper()
     df["symbol"] = df["symbol"].astype(str)

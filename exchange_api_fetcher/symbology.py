@@ -66,19 +66,30 @@ ISSUER_PREFIXES = {
     ("OKX", "spot"): ("X",),
     ("OKX", "linear_perp"): ("X",),
 }
-# Bitget "rStocks" - tokenised equities under an R prefix. EXCLUDED, not merged.
+# Bitget "rStocks" - tokenised equities under an r prefix. EXCLUDED, not merged.
 #
-# Bitget's API reports quoteVolume / baseVolume / usdtVolume that all agree with each
-# other on figures like $4.2B/day for RSPYUSDT, while Bitget's own UI shows a tiny
-# 24h spot volume for the same pair and states that as the platform figure. Whatever
-# the API number aggregates, it is not volume anyone could quote against - and it is
-# 99% of Bitget's reported spot book ($529.7B of $534.7B). The endpoint publishes no
-# alternative volume field, so these instruments are dropped rather than believed.
-# Excluding them puts BGT spot at $4.98B, next to BIN's $5.02B.
+# Bitget reports quoteVolume / baseVolume / usdtVolume that all agree with each other on
+# figures like $39.4B/day for rSPYUSDT. The daily CANDLE endpoint returns the identical
+# number, so there is no second volume field to cross-check against - but the trade tape
+# settles it: rSPY's last 100 fills span 41 HOURS and total $10,238, a run-rate near
+# $6k/day against $39.4B reported, and rNVDA's span 4.3 hours for $3,418. The same
+# measurement on BTCUSDT and HYPEUSDT lands within 2x of their reported figures, so the
+# method is sound and the rStock number is not platform volume. They are 99.95% of
+# Bitget's reported spot book ($850.5B of $850.9B); the genuine book is ~$412M.
 #
-# The `not declared COIN anywhere` guard is what keeps the 18 real R-tokens - RAY,
-# RUNE, RENDER, ROSE, RSR, RVN, RLC, RONIN - in the universe.
-RSTOCK_PREFIXES = {("BGT", "spot"): "R"}
+# IDENTIFICATION IS EXACT, NOT HEURISTIC. Bitget encodes the product in the CASE of
+# baseCoin: rSPY, rNVDA, rV - lowercase r, then the equity ticker. 671 of 1,280 spot
+# symbols match ^r[A-Z] on the native string, and they are exactly the rStocks: every
+# real R-token (RAY, RUNE, RENDER, ROSE, RSR, RVN, RLC, RONIN, RATS, RIVER, RTX, RWA,
+# RLUSD ...) is natively UPPERCASE and cannot match. So this needs no `declared COIN`
+# veto and no length guard - the previous rule tested the uppercased string with
+# `len > 2`, which let through rA rB rC rD rF rO rT rU rV (R + a one-letter ticker:
+# Visa, AT&T, Ford, Agilent, Realty Income) worth $10.5B/day of phantom volume.
+#
+# Not used: `areaSymbol == "yes"` is a superset (680) - it is a regional-restriction
+# flag that also catches USDGO, PI, SOPH and the preSPCX/preOPAI pre-IPO tokens, so it
+# would exclude ~$9.7M/day of real volume.
+RSTOCK_NATIVE_RE = {("BGT", "spot"): re.compile(r"^r[A-Z]")}
 
 
 def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
@@ -103,13 +114,15 @@ def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
         key, issuer, scale = b, "", 1.0
         ex, reason, cf = 0, "", "verified"
 
-        _rs = RSTOCK_PREFIXES.get((venue, kind))
+        _rs = RSTOCK_NATIVE_RE.get((venue, kind))
+        # the venue's own casing, before fetch_all folded base_raw to upper
+        native = getattr(r, "base_native", None) or b
         if kind in ("future", "inverse_future"):
             ex, reason = 1, "dated_future"
         elif LEVERAGED_RE.search(b):
             ex, reason = 1, "leveraged_token"
-        elif _rs and b.startswith(_rs) and len(b) > 2 and b not in declared_coin:
-            # See RSTOCK_PREFIXES: reported volume is not platform volume.
+        elif _rs and _rs.match(native):
+            # See RSTOCK_NATIVE_RE: reported volume is not platform volume.
             ex, reason = 1, "rstock_volume_unverifiable"
         else:
             # 1. scale prefix
@@ -163,6 +176,9 @@ def derive_asset_keys(spec: pd.DataFrame) -> pd.DataFrame:
     df["equity_region"] = df["asset_key"].map(reg).fillna("")
     # RWA is the superset: true for every non-crypto class
     df["is_rwa"] = df["asset_class"].isin(RWA_CLASSES).astype(int)
+    # helper only - not in the instrument_ref schema, and leaving it in makes
+    # ch_load.conform log a dropped-column warning on every run
+    df = df.drop(columns=["base_native"], errors="ignore")
     return df
 
 
