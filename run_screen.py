@@ -468,12 +468,22 @@ def main():
         kinds = ["linear_perp"] + ([] if a.no_spot else ["spot"])
         tgt = snap[snap["asset_key"].isin(sl["asset_key"]) & (snap["is_excluded"] == 0)
                    & (snap["active"] == 1) & (snap["kind"].isin(kinds))]
-        inst = [resolve(r.venue, r.kind, r.base_raw, r.quote) for r in tgt.itertuples()]
-        # resolve() re-derives the native symbol; keep only those that round-trip
-        ok = [i for i, r in zip(inst, tgt.itertuples()) if i.symbol == r.symbol]
+        # exact_symbol instruments (OKX XPERP) carry an instId no formula can rebuild,
+        # so their symbol is passed through and the round-trip check below would be
+        # comparing a value against itself. They are exempted rather than silently
+        # "passing": the check still has to mean something for the other 1,400.
+        exact = (tgt["exact_symbol"] == 1) if "exact_symbol" in tgt.columns \
+            else pd.Series(False, index=tgt.index)
+        inst = [resolve(r.venue, r.kind, r.base_raw, r.quote,
+                        symbol=r.symbol if ex else None)
+                for r, ex in zip(tgt.itertuples(), exact)]
+        ok = [i for i, r, ex in zip(inst, tgt.itertuples(), exact)
+              if ex or i.symbol == r.symbol]
         nsp = sum(i.market_type == "spot" for i in ok)
+        n_exact = int(exact.sum())
         print(f"   {len(ok)}/{len(inst)} round-tripped to a native symbol "
-              f"({len(ok) - nsp} perp, {nsp} spot)")
+              f"({len(ok) - nsp} perp, {nsp} spot"
+              + (f", {n_exact} passed through verbatim" if n_exact else "") + ")")
         deep = fetch_deep(ok, start, end, fx, workers=8)
         print(f"   {len(deep)} daily rows")
 

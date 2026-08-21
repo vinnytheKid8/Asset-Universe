@@ -47,7 +47,10 @@ def _row(**kw):
     base = dict(venue=None, symbol=None, kind=None, base_raw=None, quote=None,
                 contract_mult=1.0, inverse=0, tick=None, lot=None, min_notional=None,
                 maker_fee=None, taker_fee=None, underlying_type=None, is_rwa=None,
-                funding_interval_h=None, listed_since=None, active=1, id_source=None)
+                funding_interval_h=None, listed_since=None, active=1, id_source=None,
+                # 1 = the venue's instId cannot be rebuilt from (base, quote), so
+                # resolve() must pass it through verbatim. See OKX XPERP.
+                exact_symbol=0)
     base.update(kw)
     return base
 
@@ -114,6 +117,30 @@ def okx() -> list[dict]:
             listed_since=_ts(st.get("listTime")),
             active=1 if st.get("state") == "live" else 0,
             id_source="parsed_delimited"))
+    # OKX "XPERP": perpetuals that the API returns under instType=FUTURES with a
+    # five-year expiry in the instId (BTC-USD_UM_XPERP-310404, alias
+    # this_five_years). They pay funding and quote a mark price like any perp, so
+    # they are linear_perp here despite the dated instId - left as FUTURES they were
+    # dropped as `dated_future` and OKX-P-BTCUSDC / OKX-P-ETHUSDC never resolved,
+    # while taking ~29k fills over 90 days.
+    #
+    # settleCcy is USD; internal symbology calls these USDC, so quote is USDC or the
+    # {VENUE}-{KIND}-{BASE}{QUOTE} mapper never matches them.
+    #
+    # exact_symbol=1 because the expiry suffix cannot be derived from (base, quote):
+    # native_symbol() must not try to rebuild these, it has to use the venue's own id.
+    for st in _get(f"{OKX_B}/api/v5/public/instruments", {"instType": "FUTURES"})["data"]:
+        iid = st["instId"]
+        if "_XPERP" not in iid:
+            continue                                  # a genuine dated future
+        out.append(_row(
+            venue="OKX", symbol=iid, kind="linear_perp",
+            base_raw=st.get("ctValCcy") or iid.split("-")[0], quote="USDC",
+            contract_mult=_f(st.get("ctVal")) or 1.0, inverse=0,
+            tick=_f(st.get("tickSz")), lot=_f(st.get("lotSz")),
+            listed_since=_ts(st.get("listTime")),
+            active=1 if st.get("state") == "live" else 0,
+            exact_symbol=1, id_source="declared_xperp"))
     for st in _get(f"{OKX_B}/api/v5/public/instruments", {"instType": "SPOT"})["data"]:
         out.append(_row(
             venue="OKX", symbol=st["instId"], kind="spot",

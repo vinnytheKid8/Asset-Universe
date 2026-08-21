@@ -53,16 +53,29 @@ def contract_multiplier(venue: str, market_type: str, symbol: str) -> float:
             d = _get(f"https://api.gateio.ws/api/v4/futures/{settle}/contracts/{symbol}") or {}
             return _f(d.get("quanto_multiplier")) or 1.0
         if venue == "OKX":
+            # XPERP perps are returned under instType=FUTURES; asking for SWAP gets
+            # an empty list and a silent multiplier of 1.0, which for BTC (ctVal
+            # 0.0001) would overstate contract-denominated figures by 10,000x.
+            it = "FUTURES" if "_XPERP" in symbol else "SWAP"
             rows = (_get("https://www.okx.com/api/v5/public/instruments",
-                         {"instType": "SWAP", "instId": symbol}) or {}).get("data") or []
+                         {"instType": it, "instId": symbol}) or {}).get("data") or []
             return (_f(rows[0].get("ctVal")) or 1.0) if rows else 1.0
     except Exception as e:                                    # noqa: BLE001
         log.warning("multiplier lookup failed %s %s: %s", venue, symbol, e)
     return 1.0
 
 
-def resolve(venue: str, market_type: str, base: str, quote: str) -> Instrument:
-    sym = native_symbol(venue, market_type, base, quote)
+def resolve(venue: str, market_type: str, base: str, quote: str,
+            symbol: str | None = None) -> Instrument:
+    """Build an Instrument, rebuilding the native symbol from (base, quote).
+
+    `symbol` overrides that reconstruction for instruments whose native id CANNOT be
+    derived - currently only OKX XPERP, where the instId carries a per-asset expiry
+    (BTC-USD_UM_XPERP-310404) that no formula produces. Pass it only for specs
+    flagged exact_symbol, and take it from the venue's own instrument list: an
+    override skips the round-trip check that catches symbology bugs everywhere else.
+    """
+    sym = symbol or native_symbol(venue, market_type, base, quote)
     return Instrument(venue=venue, market_type=market_type, symbol=sym,
                       base_ccy=base.upper(), quote_ccy=quote.upper(),
                       contract_mult=contract_multiplier(venue, market_type, sym),

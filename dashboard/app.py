@@ -18,6 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
@@ -60,8 +61,16 @@ def q(sql: str) -> pd.DataFrame:
 
 
 def jsonable(df: pd.DataFrame) -> list[dict]:
-    """NaN/NaT -> None so the JSON is valid and the UI can show an em-dash."""
-    return df.astype(object).where(pd.notna(df), None).to_dict("records")
+    """NaN/NaT/±inf -> None so the JSON is valid and the UI can show an em-dash.
+
+    inf has to be handled separately from NaN: pd.notna(inf) is True, so it survives
+    the mask and then json.dumps raises "Out of range float values are not JSON
+    compliant" - a 500 on the whole endpoint, from one ratio whose denominator was a
+    hair above zero. Any x/y where y is tiny-but-positive can produce it, so this is
+    the one place to catch it rather than every query.
+    """
+    clean = df.replace([np.inf, -np.inf], np.nan)
+    return clean.astype(object).where(pd.notna(clean), None).to_dict("records")
 
 
 # --------------------------------------------------------------------------- #
@@ -78,11 +87,25 @@ def meta():
                 f"GROUP BY asset_class ORDER BY n DESC")
     dates = q(f"SELECT min(date) AS d0, max(date) AS d1, "
               f"count() AS rows FROM {DB}.instrument_daily")
+    # Every asset in the universe, not just the shortlist, so Asset detail can reach
+    # all of them. `deep` marks the ones with a real 30-day candle panel; the rest
+    # are served from the nightly snapshot.
+    all_assets = q(f"""
+        SELECT v.asset_key AS asset_key, any(v.asset_class) AS asset_class,
+               sum(v.vol24h_usd) AS vol24h_usd,
+               max(d.asset_key != '') AS deep
+        FROM (SELECT asset_key, asset_class, vol24h_usd FROM {DB}.venue_snapshot
+              WHERE run_date = (SELECT max(run_date) FROM {DB}.venue_snapshot)
+                AND is_excluded = 0 AND asset_key != '') v
+        LEFT JOIN (SELECT DISTINCT asset_key FROM {DB}.instrument_daily
+                   WHERE date >= today() - 40) d ON v.asset_key = d.asset_key
+        GROUP BY v.asset_key ORDER BY vol24h_usd DESC""")
     return {
         "run_dates": runs["run_date"].tolist() if len(runs) else [],
         "venues": venues["venue"].tolist() if len(venues) else [],
         "classes": jsonable(classes),
         "daily": jsonable(dates)[0] if len(dates) else {},
+        "assets": jsonable(all_assets),
         "defaults": DEFAULTS,
     }
 
@@ -232,10 +255,113 @@ def venues(run_date: str | None = None):
     return JSONResponse(jsonable(d))
 
 
+def _snapshot_legs(a: str, days: int):
+    """Per-instrument legs for one asset, built from the nightly snapshot.
+
+    Used two ways: as the whole leg table for an asset that never made the
+    shortlist, and as a FALLBACK for one that did but has since dropped out.
+    screen_runs_venue only holds the assets in each run's shortlist, so 128
+    assets currently have 30-day charts and an empty instruments table - the
+    history survives a shortlist exit but the legs do not.
+    """
+    w = (f"asset_key = '{a}' AND is_excluded = 0 "
+         f"AND run_date >= today() - {int(days)}")
+    return q(f"""
+        WITH s AS (
+            -- Aliases must NOT reuse a source column name: `argMax(vol24h_usd, ...)
+            -- AS vol24h_usd` makes every later reference to vol24h_usd resolve to the
+            -- aggregate, and ClickHouse rejects it as an aggregate inside an aggregate.
+            SELECT venue, kind AS market_type, symbol, quote,
+                   max(run_date) AS through, count() AS n_days,
+                   argMax(vol24h_usd, run_date) AS v24_last,
+                   argMax(oi_usd, run_date)     AS oi_last,
+                   argMax(`last`, run_date)     AS px_last,
+                   argMax(spread_bps, run_date) AS spr_bps,
+                   argMax(tick_bps, run_date)   AS tck_bps,
+                   argMax(funding_rate, run_date) * 1e4   AS fund_bps,
+                   argMax(funding_interval_h, run_date)   AS fund_iv,
+                   median(vol24h_usd) AS v24_med,
+                   arrayMap(x -> x.2, arraySort(x -> -toUInt32(x.1),
+                            groupArray((run_date, assumeNotNull(vol24h_usd))))) AS v,
+                   if(length(v) > 1 AND v[2] > 0, v[1] / v[2], NULL) AS d1,
+                   if(length(v) >= 8 AND v[8] > 0, v[1] / v[8], NULL) AS dow7,
+                   if(arrayMax(arraySlice(v, 1, 14)) > 0,
+                      v[1] / arrayMax(arraySlice(v, 1, 14)), NULL) AS off_peak,
+                   indexOf(arraySlice(v, 1, 14),
+                           arrayMax(arraySlice(v, 1, 14))) - 1 AS peak_age
+            FROM {DB}.venue_snapshot WHERE {w}
+            GROUP BY venue, market_type, symbol, quote),
+        ours AS (SELECT DISTINCT symbol FROM {DB}.internal_map
+                 WHERE run_date = (SELECT max(run_date) FROM {DB}.internal_map)
+                   AND asset_key = '{a}')
+        SELECT venue, market_type, symbol, quote,
+               symbol IN (SELECT symbol FROM ours) AS we_quote,
+               v24_last AS vol24h_usd, v24_last AS vol_usd_last,
+               d1 AS vol_d1, dow7 AS vol_dow7,
+               off_peak AS vol_off_peak, peak_age AS vol_peak_age,
+               NULL AS vol_slope7_pct_day, NULL AS vol_usd_med7,
+               v24_med AS vol_usd_med30,
+               if(v24_med > 0, v24_last / v24_med, NULL) AS vol_vs_med30,
+               NULL AS vol_share,
+               oi_last AS oi_usd_latest, NULL AS oi_usd_med30,
+               spr_bps AS spread_bps, tck_bps AS tick_bps,
+               fund_bps AS fund_bps_med, fund_iv AS fund_iv_h,
+               NULL AS maker_fee, NULL AS min_notional,
+               px_last AS px_close, through, NULL AS listed_since, n_days AS days
+        FROM s ORDER BY v24_last DESC""")
+
+
+def _series_from_snapshot(a: str, days: int) -> dict:
+    """Detail for an asset that never made the shortlist.
+
+    `instrument_daily` only holds the ~260 assets the deep 30-day fetch covers, but
+    `venue_snapshot` holds a 24h reading for every one of ~9,900 instruments, every
+    night. That is one row per instrument per run_date rather than a true daily
+    candle - no OHLC, so no intraday range - but volume, OI, funding, spread and
+    last price are exactly what the detail charts plot.
+
+    px_spread_bps is deliberately NOT computed here: venue_snapshot carries no
+    scale_factor, and cross-venue agreement without it reads 49,751 bps on
+    1000SHIBUSDT. An honest blank beats a confident wrong number.
+    """
+    w = (f"asset_key = '{a}' AND is_excluded = 0 "
+         f"AND run_date >= today() - {int(days)}")
+    byvenue = q(f"""
+        SELECT run_date AS date, venue, kind AS market_type,
+               sum(vol24h_usd) AS vol_usd, sum(oi_usd) AS oi_usd,
+               avg(last) AS px,
+               avg(funding_rate * (24 / ifNull(funding_interval_h, 8)) * 365 * 100)
+                 AS funding_apr_pct,
+               NULL AS trades
+        FROM {DB}.venue_snapshot WHERE {w}
+        GROUP BY run_date, venue, kind ORDER BY run_date, venue""")
+    total = q(f"""
+        SELECT run_date AS date, sum(vol24h_usd) AS vol_usd, sum(oi_usd) AS oi_usd,
+               uniqExact(venue) AS n_venues,
+               NULL AS px_spread_bps, NULL AS usdc_basis_bps,
+               NULL AS funding_apr_spread_pct
+        FROM {DB}.venue_snapshot WHERE {w} GROUP BY run_date ORDER BY run_date""")
+    # Same promoted band as the screen, computed over however many run_dates exist.
+    # v is newest-first so v[1] is the latest reading.
+    legs = _snapshot_legs(a, days)
+    hist = q(f"""SELECT run_date, verdict, composite, add_bar, n_fail,
+                   vol_usd_med30, oi_usd_med30, spread_bps_med, tick_bps_med
+                 FROM {DB}.screen_runs WHERE asset_key = '{a}' ORDER BY run_date""")
+    return {"by_venue": jsonable(byvenue), "total": jsonable(total),
+            "history": jsonable(hist), "legs": jsonable(legs), "source": "snapshot"}
+
+
 @app.get("/api/series")
 def series(asset: str = Query(...), days: int = 400):
     """Per-venue daily series for one asset, plus the asset-level roll-up."""
     a = asset.replace("'", "")
+    # Shortlisted assets get the real 30-day candle panel; everything else falls back
+    # to the nightly snapshot, which covers the whole universe.
+    has_daily = not q(f"SELECT 1 AS x FROM {DB}.instrument_daily "
+                      f"WHERE asset_key = '{a}' AND date >= today() - {int(days)} "
+                      f"LIMIT 1").empty
+    if not has_daily:
+        return JSONResponse(_series_from_snapshot(a, days))
     byvenue = q(f"""
         SELECT date, venue, market_type,
                sum(vol_usd) AS vol_usd, sum(oi_usd) AS oi_usd,
@@ -304,8 +430,16 @@ def series(asset: str = Query(...), days: int = 400):
         WHERE l.asset_key = '{a}'
           AND l.run_date = (SELECT max(run_date) FROM {DB}.screen_runs_venue)
         ORDER BY l.vol24h_usd DESC""")
+    # An asset that has dropped out of the shortlist keeps its daily history but has
+    # no screen_runs_venue row, which rendered the instruments table empty for 128 of
+    # them. Fall back to the snapshot so the legs are always there.
+    legs_src = "screen"
+    if legs.empty:
+        legs = _snapshot_legs(a, days)
+        legs_src = "snapshot"
     return JSONResponse({"by_venue": jsonable(byvenue), "total": jsonable(total),
-                         "history": jsonable(hist), "legs": jsonable(legs)})
+                         "history": jsonable(hist), "legs": jsonable(legs),
+                         "source": "daily", "legs_source": legs_src})
 
 
 @app.get("/api/health")

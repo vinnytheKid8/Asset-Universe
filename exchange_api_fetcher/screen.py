@@ -43,17 +43,24 @@ def _snap_bin() -> list[dict]:
 
 def _snap_okx() -> list[dict]:
     out = []
-    for r in _get(f"{OKX_B}/api/v5/market/tickers", {"instType": "SWAP"})["data"]:
-        base_v, last = _f(r.get("volCcy24h")), _f(r.get("last"))
-        out.append(dict(venue="OKX", symbol=r["instId"], last=last,
-                        vol24h_quote=(base_v * last) if (base_v and last) else None,
-                        vol24h_base=base_v, trades24h=None,
-                        bid=_f(r.get("bidPx")), ask=_f(r.get("askPx")),
-                        oi_native=None, funding_rate=None, mark=None, index=None))
-    oi = {r["instId"]: _f(r.get("oi"))
-          for r in _get(f"{OKX_B}/api/v5/public/open-interest",
-                        {"instType": "SWAP"})["data"]}
-    fr = {}
+    # SWAP and FUTURES both: OKX's XPERP perps (BTC-USD_UM_XPERP-310404) are returned
+    # under FUTURES, and the merge in fetch_snapshot is an inner join - without a
+    # ticker row here they are dropped from the universe entirely, which is how
+    # OKX-P-BTCUSDC stayed invisible while taking fills. Genuine dated futures come
+    # back too and are filtered by specs.okx(), which only keeps _XPERP.
+    for it in ("SWAP", "FUTURES"):
+        for r in _get(f"{OKX_B}/api/v5/market/tickers", {"instType": it})["data"]:
+            base_v, last = _f(r.get("volCcy24h")), _f(r.get("last"))
+            out.append(dict(venue="OKX", symbol=r["instId"], last=last,
+                            vol24h_quote=(base_v * last) if (base_v and last) else None,
+                            vol24h_base=base_v, trades24h=None,
+                            bid=_f(r.get("bidPx")), ask=_f(r.get("askPx")),
+                            oi_native=None, funding_rate=None, mark=None, index=None))
+    oi = {}
+    for it in ("SWAP", "FUTURES"):
+        oi.update({r["instId"]: _f(r.get("oi"))
+                   for r in _get(f"{OKX_B}/api/v5/public/open-interest",
+                                 {"instType": it})["data"]})
     for r in out:
         r["oi_native"] = oi.get(r["symbol"])
     return out

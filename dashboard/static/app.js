@@ -466,6 +466,14 @@ function pivot(rows, key, valKey) {
 
 function drawDetail() {
   const { asset, total, history, legs } = S.detail;
+  const snap = S.detail.source === 'snapshot';
+  const legsSnap = S.detail.legs_source === 'snapshot';
+  $('#d-source').innerHTML = snap
+    ? `<b>nightly snapshot</b> — ${total.length} daily reading${total.length === 1 ? '' : 's'}, `
+      + 'one per run. No OHLC, so no intraday range or cross-venue price agreement.'
+    : `<b>30-day panel</b> — ${total.length} days of candles.`
+      + (legsSnap ? ' Instruments below come from the nightly snapshot: this asset is '
+                  + 'not in the current shortlist, so the screen holds no legs for it.' : '');
   const mkt = $('#d-mkt').value;
   // In 'all' mode a venue contributes two rows per date (perp and spot). pivot() keys
   // on one field and last-write-wins, so keying on venue alone would silently plot only
@@ -1046,8 +1054,19 @@ async function init() {
 
     fillAxisSelects(); buildKnobs();
     await loadScreen();
-    $('#d-asset').innerHTML = S.screen.rows.map(r => r.asset_key).sort()
-      .map(a => `<option>${a}</option>`).join('');
+    // Every asset, not just the shortlist. Grouped by which store backs it, because
+    // "30-day candles" and "9 nightly readings" are not the same thing and the chart
+    // should not pretend otherwise.
+    const grp = (label, list) => list.length
+      ? `<optgroup label="${label} (${list.length})">`
+        + list.map(a => `<option>${a}</option>`).join('') + '</optgroup>' : '';
+    const all = (S.meta.assets || []).map(a => a.asset_key);
+    const deepA = (S.meta.assets || []).filter(a => a.deep).map(a => a.asset_key).sort();
+    const shalA = (S.meta.assets || []).filter(a => !a.deep).map(a => a.asset_key).sort();
+    $('#d-asset').innerHTML = all.length
+      ? grp('30-day history', deepA) + grp('nightly snapshot only', shalA)
+      : S.screen.rows.map(r => r.asset_key).sort()
+          .map(a => `<option>${a}</option>`).join('');
     // ?asset=TUT deep-links straight to one asset's detail page
     const deep = qp.get('asset');
     if (deep && S.screen.rows.some(r => r.asset_key === deep)) openDetail(deep);
