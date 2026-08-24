@@ -176,6 +176,60 @@ CREATE TABLE IF NOT EXISTS {DB}.screen_runs
     vol_usd_med30   Float64,
     vol_usd_mean30  Float64,
     vol_usd_med7    Float64,
+    -- Weekday-only twins of the level / persistence / off-peak readings. Weekend
+    -- volume is 11% of weekday on equity and 96% on crypto (measured 2026-08-23),
+    -- so every window holding a Saturday marks RWA down for the calendar alone.
+    -- score() takes the better of each pair: a weekend can help, never penalise.
+    vol_usd_med7_wd  Float64,
+    vol_usd_med30_wd Float64,
+    days_above_5m_wd Float64,
+    vol_off_peak_wd  Float64,
+    wknd_ratio       Float64,   -- weekend median / weekday median; <1 = goes quiet
+    -- Per-venue depth over the 30d history. vol_venue_med is the MEDIAN venue's
+    -- daily volume: an asset doing $16M with 82% on one venue has a median venue of
+    -- ~$1M, and summed volume cannot tell that from $16M spread evenly.
+    vol_venue_med    Float64,
+    vol_venue_mean   Float64,
+    vol_hhi_30d      Float64,   -- HHI from 30d volume; stabler than the 24h one
+    vol_top_share    Float64,   -- largest venue's share, hhi's readable twin
+    spot_vol_venue_med Float64,
+    -- What the gates and the flow score actually read once the calendar adjustment
+    -- is applied. Stored so a verdict can be explained without recomputing it.
+    adv7_cal         Float64,
+    persist_cal      Float64,
+    off_peak_cal     Float64,
+    conc_hhi         Float64,
+    -- Per-venue 30d median daily volume, largest first. Stored as a vector rather
+    -- than a count so the liquidity floor stays a dashboard knob.
+    vol_venue_1      Float64,
+    vol_venue_2      Float64,
+    vol_venue_3      Float64,
+    vol_venue_4      Float64,
+    vol_venue_5      Float64,
+    -- Venues clearing g_venue_adv. n_venues counts LISTINGS: 96% of the universe
+    -- cleared a 3-venue gate on it while the median asset's top venue carried 75%
+    -- of its volume. This is the number the gate actually reads.
+    n_venues_liq     UInt8,
+    thin_venues      UInt8,   -- fewer real venues than hard_venue_min -> drop
+    -- How much of this book is US. The volume we score is the venue TOTAL, which
+    -- includes our own flow - circular on a thin book, where we quote, volume
+    -- appears, and the screen reads a liquid venue. Measured over 7d on both sides.
+    -- our_share_max_leg is the one to watch: the single worst leg, where FARTCOIN
+    -- on Bitget perp reads 0.68 and LTC on Bitget spot reads 1.10.
+    our_vol_7d       Float64,
+    mkt_vol_7d       Float64,
+    our_vol_share    Float64,
+    our_share_max_leg Float64,
+    our_fills_7d     Float64,
+    -- Our share of OPEN INTEREST. Position = session + outside - invested, valued
+    -- at the last traded price x contract_mult. Both sides are restricted to legs
+    -- the venue reports OI for: Bitget publishes none, so counting our BGT position
+    -- against an OI total that excludes Bitget inflated the ratio above 100% of the
+    -- worst leg, which is impossible for a share.
+    our_oi_usd       Float64,
+    venue_oi_usd     Float64,
+    our_oi_share     Float64,
+    our_oi_share_max_leg Float64,
     vol_trend       Float64,
     vol_burstiness  Float64,
     vol_slope_pct_day Float64,

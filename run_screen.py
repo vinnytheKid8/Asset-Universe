@@ -69,6 +69,71 @@ def traded_instruments(days: int = 10) -> pd.DataFrame:
     return t[t["name"].str.match(r"^[A-Z]{3}-(S|P|IP|F|IF)-")].copy()
 
 
+def our_participation(mp: pd.DataFrame, spec: pd.DataFrame,
+                      days: int = 7) -> pd.DataFrame:
+    """Our own traded notional per (venue, symbol, mkt), in USD.
+
+    The denominator problem: an asset's venue count is evidence that OTHER people
+    trade it, but the volume we score is the venue's total - which includes us. On a
+    thin book that is circular: we quote there, volume appears, the screen reads a
+    liquid venue, we keep quoting. Measured 2026-08-24, our share of the book runs a
+    0.4% median above $20M/day and a 4.4% median below $0.5M/day - with a p90 of 36%
+    and a max of 110% (LTC on Bitget spot, where we ARE the book).
+
+    notional = price x qty x contract_mult, joined through the internal map because
+    the internal name carries no native symbol. INVERSE contracts are excluded: their
+    qty is already denominated in USD, so the same formula overstates them by the
+    price - OKX BTC-USD-SWAP read $1.04 TRILLION over 7 days before they were cut.
+    """
+    f = ch(f"""
+    WITH nm AS (SELECT symbol_id,
+                 argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
+                FROM strat__tk_alex.symbols_record GROUP BY symbol_id),
+    ex AS (
+        SELECT nm.name AS name, sum(e.price * e.qty) AS raw_notional,
+               count() AS our_fills, argMax(e.price, e.local_nanos) AS last_px
+        FROM strat__tk_alex.dop_exec_record e
+        LEFT JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
+        WHERE e.local_nanos >= now() - INTERVAL {int(days)} DAY
+        GROUP BY nm.name),
+    po AS (
+        -- our position = session + outside - invested (confirmed 2026-08-24).
+        -- invested_position is NOT always zero - 14,143 rows carry it - so dropping
+        -- it overstates the position wherever it is set.
+        SELECT nm.name AS name,
+               argMax(p.session_position, p.local_nanos)
+             + argMax(p.outside_position, p.local_nanos)
+             - argMax(p.invested_position, p.local_nanos) AS our_pos
+        FROM strat__tk_alex.positions_record p
+        LEFT JOIN nm ON CAST(p.symbol_id AS UInt64) = nm.symbol_id
+        WHERE p.local_nanos >= now() - INTERVAL 12 HOUR
+        GROUP BY nm.name)
+    SELECT ex.name AS name, ex.raw_notional AS raw_notional, ex.our_fills AS our_fills,
+           ex.last_px AS last_px, ifNull(po.our_pos, 0) AS our_pos
+    FROM ex LEFT JOIN po ON po.name = ex.name""")
+    cols = ["venue", "symbol", "mkt", "our_notional", "our_fills", "our_oi_usd"]
+    if f.empty or mp.empty:
+        return pd.DataFrame(columns=cols)
+    link = mp.loc[mp["match_rule"] != "UNMATCHED",
+                  ["name", "venue", "kind", "symbol"]].drop_duplicates("name")
+    d = f.merge(link, on="name", how="inner")
+    sp = spec.drop_duplicates(["venue", "symbol", "kind"])[
+        ["venue", "symbol", "kind", "contract_mult", "inverse"]]
+    d = d.merge(sp, on=["venue", "symbol", "kind"], how="left")
+    d = d[d["inverse"] != 1]
+    mult = d["contract_mult"].fillna(1.0)
+    d["our_notional"] = d["raw_notional"] * mult
+    # Position -> USD at the last traded price. Spot legs carry no OI, so this is
+    # only meaningful on perps and is dropped for spot below.
+    d["our_oi_usd"] = d["our_pos"].abs() * d["last_px"] * mult
+    d["mkt"] = np.where(d["kind"] == "spot", "spot", "perp")
+    d.loc[d["mkt"] == "spot", "our_oi_usd"] = np.nan
+    return (d.groupby(["venue", "symbol", "mkt"], as_index=False)
+             .agg(our_notional=("our_notional", "sum"),
+                  our_fills=("our_fills", "sum"),
+                  our_oi_usd=("our_oi_usd", "sum")))[cols]
+
+
 def _med(s: pd.Series) -> float:
     """median() that returns NaN for an all-NaN group without a numpy warning.
 
@@ -113,8 +178,8 @@ def find_duplicate_tickers(snap: pd.DataFrame, tol: float = 0.004) -> pd.DataFra
     return pd.DataFrame(hits).sort_values("diff_bps") if hits else pd.DataFrame()
 
 
-def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
-                  spec: pd.DataFrame) -> pd.DataFrame:
+def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame, spec: pd.DataFrame,
+                  part: pd.DataFrame | None = None) -> pd.DataFrame:
     """Per-asset level / trend / stability / structure, from the 30d daily history."""
     d = deep.copy()
     d["date"] = pd.to_datetime(d["date"])
@@ -157,6 +222,36 @@ def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
         g = g.sort_values("date")
         v = g["vol_usd"].replace(0, np.nan)
         v7, v30 = v.tail(7).median(), v.median()
+        # ---- calendar-clean twins -------------------------------------------
+        # Volume has a weekday cycle that is mild on crypto (weekend/weekday 0.96)
+        # and brutal on RWA (equity 0.11, commodity 0.20 - measured 2026-08-23 over
+        # the 30d panel). Every level and persistence metric below therefore reads
+        # low for an RWA purely because two of every seven days are a weekend, and
+        # the gates cannot tell that from a genuine decline.
+        #
+        # These are the SAME metrics over weekdays only. score() takes the better of
+        # the two, so a weekend can help an asset but never penalise it - which is
+        # the asymmetry we actually want: a name that trades through the weekend has
+        # earned the higher number, a name that cannot should not be marked down for
+        # it twice (once here, once in every window that contains a Saturday).
+        # The window is held FIXED and weekend days are dropped from inside it -
+        # NOT "the last 7 weekday observations", which reaches ~10 calendar days back
+        # and measures a longer window rather than a cleaner one. Getting that wrong
+        # made a rising crypto name read a 0.60x "calendar lift" that was pure window
+        # length (RATS: 13.49 -> 10.76 by pulling in three older, quieter days).
+        wd = g[g["date"].dt.dayofweek < 5]
+        we = g[g["date"].dt.dayofweek >= 5]
+        vwd = wd["vol_usd"].replace(0, np.nan)
+        g7 = g.tail(7)
+        v7_wd = (g7[g7["date"].dt.dayofweek < 5]["vol_usd"]
+                 .replace(0, np.nan).median())
+        v30_wd = vwd.median()
+        # off-peak twin: latest weekday vs the weekday max inside the same trailing
+        # 14 calendar days, so both sides of the ratio are weekdays.
+        g14 = g.tail(14)
+        w14 = g14[g14["date"].dt.dayofweek < 5].sort_values("date", ascending=False)
+        dwd = w14["vol_usd"].to_numpy(dtype=float)
+        dwd = dwd[dwd > 0]
         # --- onset detection: a name that listed mid-window must not be judged on
         # 30-day persistence. "Live" = a day with >10% of the asset's own recent
         # median volume; onset = the first such day.
@@ -214,6 +309,18 @@ def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
                         if len(vd) >= 7 and np.median(vd[:7]) > 0 else np.nan),
             "vol_off_peak": (vd[0] / vd[:14].max()
                              if len(vd) and vd[:14].max() > 0 else np.nan),
+            # weekday-only twins. Same formulas, Mon-Fri only. See the note above.
+            "vol_usd_med7_wd": v7_wd,
+            "vol_usd_med30_wd": v30_wd,
+            "days_above_5m_wd": (float((wd["vol_usd"] >= 5e6).mean())
+                                 if len(wd) else np.nan),
+            "vol_off_peak_wd": (dwd[0] / dwd.max()
+                                if len(dwd) and dwd.max() > 0 else np.nan),
+            # <1 means the asset goes quiet at weekends; ~1 means it does not. The
+            # diagnostic behind the adjustment, so the correction is never invisible.
+            "wknd_ratio": (float(we["vol_usd"].replace(0, np.nan).median()
+                                 / vwd.median())
+                           if len(we) and len(wd) and vwd.median() else np.nan),
             "vol_slope_pct_day": slope,
             "vol_logmad": (lv - lv.median()).abs().median() if len(lv) > 3 else np.nan,
             "days_above_5m": float((g["vol_usd"] >= 5e6).mean()),
@@ -263,6 +370,100 @@ def asset_metrics(deep: pd.DataFrame, snap: pd.DataFrame,
     vs["sh"] = vs["vol24h_usd"] / tot.replace(0, np.nan)
     hhi = vs.groupby("asset_key")["sh"].apply(lambda x: float((x ** 2).sum()))
     m = m.merge(hhi.rename("venue_hhi"), on="asset_key", how="left")
+
+    # ---- per-venue DEPTH, from the 30d history -------------------------------
+    # venue_hhi above is one 24h reading off the live snapshot: fine as a live
+    # diagnostic, too noisy to score on. These are the same shape over 30 days.
+    #
+    # vol_venue_med is the point: the MEDIAN venue's daily volume, not the sum. An
+    # asset doing $16M across five venues where one carries 82% has a median venue
+    # of ~$1M, and that is what quoting it actually feels like. Summed volume cannot
+    # tell that apart from $16M spread evenly, which is a completely different book.
+    pv = d.groupby(["asset_key", "venue"])["vol_usd"].median()
+    m = m.merge(pv.groupby("asset_key").median().rename("vol_venue_med"),
+                on="asset_key", how="left")
+    m = m.merge(pv.groupby("asset_key").mean().rename("vol_venue_mean"),
+                on="asset_key", how="left")
+    tv = d.groupby(["asset_key", "venue"])["vol_usd"].sum()
+    tsh = tv / tv.groupby("asset_key").transform("sum").replace(0, np.nan)
+    m = m.merge(tsh.pow(2).groupby("asset_key").sum().rename("vol_hhi_30d"),
+                on="asset_key", how="left")
+    # top_share is hhi's readable twin: "Binance is 82% of this" lands where 0.694
+    # does not, and it is the number to put in front of a human.
+    m = m.merge(tsh.groupby("asset_key").max().rename("vol_top_share"),
+                on="asset_key", how="left")
+    # ---- the per-venue volume VECTOR, largest first --------------------------
+    # Stored as columns rather than collapsed to a count so the liquidity floor stays
+    # a dashboard knob: score() counts how many of these clear g_venue_adv, and the
+    # threshold can be swept without re-running the pipeline. Five venues, so five
+    # columns; absent venues stay NaN and never count.
+    #
+    # This is what n_venues could not say. Across the universe the median asset's
+    # top venue carries 75% of its volume and its 3rd carries 6.6% ($1.1M) - so a
+    # plain venue COUNT passes 96% of assets through a 3-venue gate, which is not a
+    # gate. RATS: BIN $6.8M, then $0.98M, $0.96M, $0.19M.
+    ranked = (d.groupby(["asset_key", "venue"])["vol_usd"].median()
+              .rename("v").reset_index()
+              .sort_values(["asset_key", "v"], ascending=[True, False]))
+    ranked["rk"] = ranked.groupby("asset_key").cumcount() + 1
+    wide = (ranked[ranked["rk"] <= 5]
+            .pivot(index="asset_key", columns="rk", values="v")
+            .rename(columns=lambda i: f"vol_venue_{i}"))
+    for i in range(1, 6):
+        if f"vol_venue_{i}" not in wide.columns:
+            wide[f"vol_venue_{i}"] = np.nan
+    m = m.merge(wide[[f"vol_venue_{i}" for i in range(1, 6)]], on="asset_key", how="left")
+
+    # ---- how much of this book is US -----------------------------------------
+    # Matched to the participation window (7d) on both sides, or the ratio compares
+    # a week of our flow against a month of the venue's.
+    if part is not None and len(part):
+        recent = d[d["date"] >= d["date"].max() - pd.Timedelta(days=6)]
+        mv = (recent.groupby(["asset_key", "venue", "symbol"], as_index=False)
+                    .agg(mkt7=("vol_usd", "sum")))
+        pp = part[part["mkt"] == "perp"]
+        mv = mv.merge(pp[["venue", "symbol", "our_notional", "our_fills"]],
+                      on=["venue", "symbol"], how="left")
+        mv["our_notional"] = mv["our_notional"].fillna(0.0)
+        mv["leg_share"] = mv["our_notional"] / mv["mkt7"].replace(0, np.nan)
+        ag = mv.groupby("asset_key").agg(
+            our_vol_7d=("our_notional", "sum"), mkt_vol_7d=("mkt7", "sum"),
+            our_share_max_leg=("leg_share", "max"),
+            our_fills_7d=("our_fills", "sum"))
+        ag["our_vol_share"] = ag["our_vol_7d"] / ag["mkt_vol_7d"].replace(0, np.nan)
+        # OI share, latest day, perp only
+        last = d[d["date"] == d["date"].max()]
+        oi = (last.groupby(["asset_key", "venue", "symbol"], as_index=False)
+                  .agg(v_oi=("oi_usd", "sum"))
+                  .merge(pp[["venue", "symbol", "our_oi_usd"]],
+                         on=["venue", "symbol"], how="left"))
+        oi["our_oi_usd"] = oi["our_oi_usd"].fillna(0.0)
+        # Both sides restricted to legs the venue actually reports OI for. Bitget
+        # publishes no OI history, so counting our BGT position in the numerator
+        # while its OI is missing from the denominator inflates the ratio - RATS read
+        # 1.38% aggregate against a 0.84% worst leg, which is arithmetically
+        # impossible for a share.
+        oi = oi[oi["v_oi"] > 0]
+        oi["leg_oi_share"] = oi["our_oi_usd"] / oi["v_oi"]
+        oa = oi.groupby("asset_key").agg(our_oi_usd=("our_oi_usd", "sum"),
+                                         venue_oi_usd=("v_oi", "sum"),
+                                         our_oi_share_max_leg=("leg_oi_share", "max"))
+        oa["our_oi_share"] = (oa["our_oi_usd"]
+                              / oa["venue_oi_usd"].replace(0, np.nan))
+        ag = ag.join(oa)
+        m = m.merge(ag.reset_index(), on="asset_key", how="left")
+    else:
+        for c in ("our_vol_7d", "mkt_vol_7d", "our_share_max_leg", "our_fills_7d",
+                  "our_vol_share", "our_oi_usd", "venue_oi_usd", "our_oi_share",
+                  "our_oi_share_max_leg"):
+            m[c] = np.nan
+
+    if len(spot):
+        spv = spot.groupby(["asset_key", "venue"])["vol_usd"].median()
+        m = m.merge(spv.groupby("asset_key").median().rename("spot_vol_venue_med"),
+                    on="asset_key", how="left")
+    else:
+        m["spot_vol_venue_med"] = np.nan
     # Bitget publishes no OI HISTORY, so the 30d OI series omits it. Quantify the
     # understatement from the live snapshot, where Bitget's OI *is* available.
     oi_live = s.groupby("asset_key")["oi_usd"].sum().rename("oi_usd_live")
@@ -494,7 +695,11 @@ def main():
     emit(deep, "deep_daily")
 
     print("== 5. asset metrics ==")
-    m = asset_metrics(deep, snap, spec)
+    part = our_participation(mp, spec)
+    if len(part):
+        print(f"   our own flow: {len(part)} legs, "
+              f"${part.our_notional.sum()/1e6:,.0f}M over 7d")
+    m = asset_metrics(deep, snap, spec, part=part)
     m["traded"] = m["asset_key"].isin(traded_assets)
     emit(m, "asset_metrics")
     vm = venue_metrics(deep, snap, spec, mp)

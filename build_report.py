@@ -35,6 +35,17 @@ DEFAULTS = dict(
     g_adv=G_ADV,                # $/day, 30d median (7d for lane A)
     g_persist=G_PERSIST,        # share of days above $5M
     g_venues=G_VENUES,          # perp venues carrying the asset
+    # Minimum 30d-median daily volume for a venue to COUNT toward g_venues. 0
+    # reproduces the old behaviour, where any listing with a single dollar of volume
+    # counted as a venue.
+    #
+    # That old behaviour made the venue gate almost non-binding: 96% of the universe
+    # cleared 3 venues, while the median asset's top venue carried 75% of its volume
+    # and its third carried 6.6% ($1.1M). "4 venues" mostly meant one real book and a
+    # tail of token listings - no redundancy, no cross-venue hedge, which is the only
+    # reason the gate exists. RATS is the case that surfaced it: BIN $6.8M, then
+    # $1.1M, $1.0M, $0.2M, and it read as a comfortable 4-venue asset.
+    g_venue_adv=1e6,
     g_oi=G_OI,                  # $ open interest, 30d median
     lane_days=21,               # days since volume onset below which lane A applies
     new_listing_days=NEW_LISTING_DAYS,
@@ -51,23 +62,123 @@ DEFAULTS = dict(
     decay_off_peak=0.0,         # e.g. 0.25 => "trading under a quarter of its 14d peak"
     decay_r37=1.0,              # ...and 3d median / 7d median below this
     n_fail_drop=2,              # gates failed before an asset we trade is dropped
+    # Venues with real volume below which an asset we trade is dropped OUTRIGHT,
+    # whatever else it passes. 0 = off (venue count stays one fungible gate of four).
+    #
+    # The four gates are not four independent questions. ADV and persistence agree
+    # 98.5% of the time and both agree ~94% with OI: all three ask "is there enough
+    # flow", measured three ways. Only the venue gate asks a different question -
+    # can we quote two sides and hedge across books - and pass rates of 94/93/97%
+    # against 77% mean "fail any 2 of 4" almost never fires on a single-venue asset,
+    # however concentrated. KITE reads 5 venues and has ONE clearing $1M ($4.30M,
+    # then $0.59M, $0.34M).
+    #
+    # Size cannot substitute for redundancy: an asset with one book is one venue
+    # outage or one listing change away from being unquotable, at any ADV.
+    hard_venue_min=2,
     w_flow=0.40, w_structure=0.25, w_carry=0.15, w_friction=0.20,
+
+    # ---- flow level window --------------------------------------------------
+    # 1 = the flow score reads the 7-day median, 0 = the 30-day median. 7d is the
+    # default because a 30-day level is a month-old view of a book you quote today,
+    # and a pump can hold it up for the full month (RATS 2026-08-23: 30d median
+    # $9.95M on a pre-pump baseline of $2.37M). The ADV *gate* still reads 30d - the
+    # gate is a floor and wants to be slow; the score is a ranking and wants to be
+    # current.
+    flow_use_7d=1,
+    # ---- calendar adjustment ------------------------------------------------
+    # 1 = every volume level, persistence and off-peak reading takes the BETTER of
+    # the all-days and weekday-only value. Deliberately asymmetric: a weekend can
+    # help an asset and can never hurt it.
+    #
+    # Measured over the 30d panel on 2026-08-23, weekend volume as a share of
+    # weekday: equity 0.11, commodity 0.20, rwa 0.22, crypto 0.96. So every window
+    # containing a Saturday marks RWA down by 4-9x for the calendar alone, and on a
+    # Sunday the off-peak rule reads every asset as collapsing (BTC 0.296 vs 1.000
+    # weekday-clean). Without this the screen is a weekday/weekend coin flip.
+    calendar_adjust=1,
+    # ---- flow depth ---------------------------------------------------------
+    # 1 = the third flow term is the MEDIAN VENUE's daily volume; 0 = trades/day.
+    # trades/day is published by Binance and by nobody else (17,323 of 17,323 BIN
+    # rows carry it, 0 on OKX/BGT/GAT/KCN), so as a third of the flow score it was
+    # rewarding Binance concentration - the opposite of what we want. Median-venue
+    # volume asks "what does the book look like away from the leader", which is the
+    # question that actually matters when quoting.
+    flow_venue_depth=1,
+    # Extra explicit penalty on top, for exceedingly imbalanced books. 0 = off.
+    # A share of c_flow removed, scaled by how far HHI sits above flow_conc_free:
+    #   penalty = flow_conc_penalty * clip((hhi - free) / (1 - free), 0, 1)
+    # Ships OFF: median-venue depth above already prices imbalance in, and stacking
+    # a second penalty changes which assets get dropped - a trading decision.
+    flow_conc_penalty=0.0,
+    flow_conc_free=0.40,        # HHI at or below this is not penalised at all
 )
 
 
 def score(m: pd.DataFrame, p: dict | None = None) -> pd.DataFrame:
     p = {**DEFAULTS, **(p or {})}
     d = m.copy()
+
+    def num(col: str) -> pd.Series:
+        """A column as floats, with 0 read as MISSING.
+
+        Load-bearing for every metric added after a table already existed. ch_load
+        leaves a column absent from the frame at the ClickHouse default, and for
+        Float64 that default is 0.0 - not NULL. So `.fillna(fallback)` never fires
+        on a freshly migrated column and the score silently reads zeros until the
+        next nightly run writes real values. An HHI of 0 is arithmetically
+        impossible (the floor is 1/n) and a median venue volume of 0 means "no
+        data", so treating 0 as missing is right for all of these anyway.
+        """
+        v = pd.to_numeric(d[col], errors="coerce") if col in d.columns \
+            else pd.Series(np.nan, index=d.index)
+        return v.replace(0, np.nan)
+
+    def better(col: str, wd_col: str) -> pd.Series:
+        """The kinder of the all-days and weekday-only reading of one metric.
+
+        fmax, not maximum: NaN on either side must not poison the result, and the
+        weekday twins are NaN for an asset whose window holds no weekday yet.
+
+        Guarded on presence because screen_runs rows written before these columns
+        existed still have to score - the dashboard reads history, not just today.
+        """
+        a = pd.to_numeric(d[col], errors="coerce")
+        if not p["calendar_adjust"] or wd_col not in d.columns:
+            return a
+        return np.fmax(a, pd.to_numeric(d[wd_col], errors="coerce"))
+
+    adv7 = better("vol_usd_med7", "vol_usd_med7_wd")
+    adv30 = better("vol_usd_med30", "vol_usd_med30_wd")
+    persist = better("days_above_5m", "days_above_5m_wd")
+    off_peak = better("vol_off_peak", "vol_off_peak_wd")
+    d["adv7_cal"] = adv7
+    d["persist_cal"], d["off_peak_cal"] = persist, off_peak
     # A name that listed mid-window has no 30-day history to be persistent over.
     # Lane A (FRAMEWORK.md s2): judge it on the days it was actually live.
     d["lane"] = np.where(d["days_since_onset"] < p["lane_days"], "new", "established")
-    d["gate_adv"] = np.where(d["lane"] == "new",
-                             d["vol_usd_med7"] >= p["g_adv"],
-                             d["vol_usd_med30"] >= p["g_adv"])
+    # Gates read the calendar-adjusted values. Lane A keeps days_above_5m_live: it
+    # is already measured only over the days the asset was live, which is its own
+    # window correction, and mixing the two would compound them.
+    d["gate_adv"] = np.where(d["lane"] == "new", adv7 >= p["g_adv"],
+                             adv30 >= p["g_adv"])
     d["gate_persist"] = np.where(d["lane"] == "new",
                                  d["days_above_5m_live"].fillna(0) >= p["g_persist"],
-                                 d["days_above_5m"] >= p["g_persist"])
-    d["gate_venues"] = d["n_venues"] >= p["g_venues"]
+                                 persist >= p["g_persist"])
+    # Venues that clear the liquidity floor, counted off the stored per-venue vector
+    # so the floor is sweepable. Falls back to the raw count for rows written before
+    # the vector existed (num() reads 0 as missing - a migrated column defaults to
+    # 0.0, not NULL).
+    vcols = [f"vol_venue_{i}" for i in range(1, 6)]
+    if p["g_venue_adv"] > 0 and all(c in d.columns for c in vcols):
+        liq = sum((num(c) >= p["g_venue_adv"]).astype(int) for c in vcols)
+        # A row with no vector at all (old history) keeps its raw count rather than
+        # being failed for a column that did not exist when it was written.
+        have_vec = pd.concat([num(c) for c in vcols], axis=1).notna().any(axis=1)
+        d["n_venues_liq"] = liq.where(have_vec, d["n_venues"])
+    else:
+        d["n_venues_liq"] = d["n_venues"]
+    d["gate_venues"] = d["n_venues_liq"] >= p["g_venues"]
     d["gate_oi"] = d["oi_usd_med30"] >= p["g_oi"]
     gates = ["gate_adv", "gate_persist", "gate_venues", "gate_oi"]
     d["n_fail"] = (~d[gates]).sum(axis=1)
@@ -83,7 +194,9 @@ def score(m: pd.DataFrame, p: dict | None = None) -> pd.DataFrame:
     # is exactly the thing the established-only rule was written to avoid flagging by
     # accident - here it is the thing we are trying to catch.
     if p["decay_off_peak"] > 0 and "vol_off_peak" in d.columns:
-        d["decay_fast"] = ((d["vol_off_peak"] < p["decay_off_peak"])
+        # off_peak_cal, not raw: on a Sunday the raw ratio compares a weekend day
+        # against a weekday peak and reads every asset as collapsing.
+        d["decay_fast"] = ((off_peak < p["decay_off_peak"])
                            & (d["vol_r37"].fillna(1.0) < p["decay_r37"]))
     else:
         d["decay_fast"] = False
@@ -93,9 +206,24 @@ def score(m: pd.DataFrame, p: dict | None = None) -> pd.DataFrame:
     def pct(s, asc=True):
         return s.rank(pct=True, ascending=asc, na_option="bottom") * 100
 
-    d["c_flow"] = (pct(np.log10(d["vol_usd_med30"].clip(lower=1)))
-                   + pct(d["days_above_5m"]) + pct(np.log10(d["trades_med30"]
-                                                            .fillna(1).clip(lower=1)))) / 3
+    # Flow = level + persistence + depth, all three calendar-adjusted where they can
+    # be. `lvl` is the 7d median by default (flow_use_7d); `depth` is the median
+    # venue's volume rather than Binance-only trade counts (flow_venue_depth).
+    lvl = adv7 if p["flow_use_7d"] else adv30
+    trades = pd.to_numeric(d["trades_med30"], errors="coerce")
+    # Fall back to trades wherever venue depth is genuinely absent, so a
+    # part-migrated table scores on the best available column per row.
+    depth = num("vol_venue_med").fillna(trades) if p["flow_venue_depth"] else trades
+    d["c_flow"] = (pct(np.log10(lvl.fillna(1).clip(lower=1)))
+                   + pct(persist)
+                   + pct(np.log10(depth.fillna(1).clip(lower=1)))) / 3
+    # Optional extra penalty for an exceedingly imbalanced book. Prefer the 30d HHI
+    # (stable) and fall back to the live-snapshot one only if it is absent.
+    hhi_src = num("vol_hhi_30d").fillna(num("venue_hhi"))
+    d["conc_hhi"] = hhi_src
+    free = min(max(p["flow_conc_free"], 0.0), 0.99)
+    excess = ((hhi_src - free) / (1 - free)).clip(lower=0, upper=1).fillna(0)
+    d["c_flow"] = d["c_flow"] * (1 - p["flow_conc_penalty"] * excess)
     d["c_structure"] = (pct(d["n_venues"]) + pct(1 - d["venue_hhi"])
                         + pct(d["venues_spot"])) / 3
     d["c_carry"] = pct(d["fund_spread_bps_med"].abs())
@@ -115,8 +243,14 @@ def score(m: pd.DataFrame, p: dict | None = None) -> pd.DataFrame:
     bar = float(kept["composite"].median()) if len(kept) else 50.0
     d["add_bar"] = bar
     d["verdict"] = "hold"
-    d.loc[d.traded & ((d.n_fail >= nf) | d.decaying), "verdict"] = "drop"
-    d.loc[d.traded & (d.n_fail < nf) & ~d.decaying, "verdict"] = "keep"
+    # Structural disqualifier, evaluated alongside the fungible gate count.
+    thin = (d["n_venues_liq"] < p["hard_venue_min"]) if p["hard_venue_min"] else False
+    d["thin_venues"] = thin if isinstance(thin, pd.Series) else pd.Series(
+        False, index=d.index)
+    d.loc[d.traded & ((d.n_fail >= nf) | d.decaying | d["thin_venues"]),
+          "verdict"] = "drop"
+    d.loc[d.traded & (d.n_fail < nf) & ~d.decaying & ~d["thin_venues"],
+          "verdict"] = "keep"
     d.loc[(~d.traded) & (d.n_fail == 0) & (d.composite >= bar), "verdict"] = "add"
     d.loc[(~d.traded) & ((d.n_fail > 0) | (d.composite < bar)), "verdict"] = "watch"
     return d.sort_values("composite", ascending=False)

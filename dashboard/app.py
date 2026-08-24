@@ -201,6 +201,8 @@ def screen_impl(run_date: str | None = None,
                 g_adv: float = DEFAULTS["g_adv"],
                 g_persist: float = DEFAULTS["g_persist"],
                 g_venues: float = DEFAULTS["g_venues"],
+                g_venue_adv: float = DEFAULTS["g_venue_adv"],
+                hard_venue_min: int = DEFAULTS["hard_venue_min"],
                 g_oi: float = DEFAULTS["g_oi"],
                 lane_days: int = DEFAULTS["lane_days"],
                 new_listing_days: int = DEFAULTS["new_listing_days"],
@@ -213,7 +215,12 @@ def screen_impl(run_date: str | None = None,
                 w_flow: float = DEFAULTS["w_flow"],
                 w_structure: float = DEFAULTS["w_structure"],
                 w_carry: float = DEFAULTS["w_carry"],
-                w_friction: float = DEFAULTS["w_friction"]):
+                w_friction: float = DEFAULTS["w_friction"],
+                flow_use_7d: int = DEFAULTS["flow_use_7d"],
+                calendar_adjust: int = DEFAULTS["calendar_adjust"],
+                flow_venue_depth: int = DEFAULTS["flow_venue_depth"],
+                flow_conc_penalty: float = DEFAULTS["flow_conc_penalty"],
+                flow_conc_free: float = DEFAULTS["flow_conc_free"]):
     """Re-score a run under caller-supplied parameters.
 
     Returns both the recomputed verdicts and the baseline (DEFAULTS) verdicts, so
@@ -221,12 +228,17 @@ def screen_impl(run_date: str | None = None,
     """
     m = _metrics(run_date)
     params = dict(g_adv=g_adv, g_persist=g_persist, g_venues=g_venues, g_oi=g_oi,
+                  g_venue_adv=g_venue_adv, hard_venue_min=hard_venue_min,
                   lane_days=lane_days, new_listing_days=new_listing_days,
                   tick_pinned_ratio=tick_pinned_ratio, decay_trend=decay_trend,
                   decay_slope=decay_slope, decay_off_peak=decay_off_peak,
                   decay_r37=decay_r37, n_fail_drop=n_fail_drop,
                   w_flow=w_flow, w_structure=w_structure, w_carry=w_carry,
-                  w_friction=w_friction)
+                  w_friction=w_friction, flow_use_7d=flow_use_7d,
+                  calendar_adjust=calendar_adjust,
+                  flow_venue_depth=flow_venue_depth,
+                  flow_conc_penalty=flow_conc_penalty,
+                  flow_conc_free=flow_conc_free)
     cur = score(m, params)
     base = score(m)[["asset_key", "verdict", "composite", "n_fail"]].rename(
         columns={"verdict": "base_verdict", "composite": "base_composite",

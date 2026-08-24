@@ -35,6 +35,10 @@ const KNOBS = [
   ['g_persist', 'Days above $5M', 0, 1, .05, null, pct1],
   ['g_venues', 'Perp venues', 1, 6, 1, null, v => v],
   ['g_oi', 'Open interest floor', 1e5, 1e9, null, 'log', v => '$' + fmtUsd(v).slice(1)],
+  ['g_venue_adv', 'Volume for a venue to count', 0, 1e7, null, 'log',
+   v => +v === 0 ? 'any listing counts' : '$' + fmtUsd(v).slice(1) + '/day'],
+  ['hard_venue_min', 'Drop below N real venues', 0, 4, 1, null,
+   v => +v === 0 ? 'off' : `< ${v} venues -> drop`],
   ['__d', 'Drop rule'],
   ['n_fail_drop', 'Gates failed to drop', 1, 4, 1, null, v => '≥ ' + v],
   ['decay_trend', 'Decay: 7d/30d below', .2, 1.2, .05, null, v => (+v).toFixed(2)],
@@ -48,6 +52,16 @@ const KNOBS = [
   ['lane_days', 'Lane A: days since onset', 3, 60, 1, null, v => v + 'd'],
   ['new_listing_days', 'Flag as new listing', 3, 60, 1, null, v => v + 'd'],
   ['tick_pinned_ratio', 'Tick-pinned if spread ≤ tick ×', 1, 2, .05, null, v => '×' + (+v).toFixed(2)],
+  ['__f', 'Flow definition'],
+  // 0/1 sliders read as toggles. Kept in the same list as everything else so the
+  // Link button and the method text pick them up without a second mechanism.
+  ['flow_use_7d', 'Level window', 0, 1, 1, null, v => +v ? '7-day median' : '30-day median'],
+  ['calendar_adjust', 'Ignore weekend drag', 0, 1, 1, null, v => +v ? 'on' : 'off'],
+  ['flow_venue_depth', 'Depth term', 0, 1, 1, null,
+   v => +v ? 'median venue volume' : 'trades/day (BIN only)'],
+  ['flow_conc_penalty', 'Concentration penalty', 0, 1, .05, null,
+   v => +v === 0 ? 'off' : `up to −${(v * 100).toFixed(0)}%`],
+  ['flow_conc_free', 'Penalty-free HHI up to', .2, .9, .05, null, v => (+v).toFixed(2)],
   ['__w', 'Composite weights'],
   ['w_flow', 'Flow', 0, 1, .05, null, v => (+v).toFixed(2)],
   ['w_structure', 'Structure', 0, 1, .05, null, v => (+v).toFixed(2)],
@@ -137,6 +151,14 @@ const AXES = [
   ['vol_r37', 'Volume 3d/7d (fast direction)'], ['vol_d1', 'Volume day-over-day'],
   ['vol_trend', '7d/30d volume ratio (LEVEL, not direction)'],
   ['days_above_5m', 'Share of days above $5M'],
+  ['vol_venue_med', 'Median venue volume (USD/day)'],
+  ['vol_top_share', 'Largest venue share'],
+  ['vol_hhi_30d', 'Venue HHI (30d volume)'],
+  ['wknd_ratio', 'Weekend / weekday volume'],
+  ['our_vol_share', 'Our share of volume'],
+  ['our_share_max_leg', 'Our share of the worst leg'],
+  ['our_oi_share', 'Our share of OI'],
+  ['our_oi_share_max_leg', 'Our share of OI, worst leg'],
   ['venue_hhi', 'Venue concentration (HHI)'], ['trades_med30', 'Trades/day (Binance)'],
   ['fund_spread_bps_med', 'Cross-venue funding spread (bps)'],
   ['days_since_onset', 'Days since volume onset'], ['age_days', 'Age (days)'],
@@ -241,6 +263,11 @@ const SCREEN_COLS = [
   ['asset_key', 'Asset', 'k'], ['verdict', 'Verdict', 'v'], ['lane', 'Lane', 't'],
   ['asset_class', 'Class', 't'], ['traded', 'We trade', 'b'],
   ['composite', 'Composite', 'n1'], ['add_bar', 'Bar', 'n1'],
+  ['vol_venue_med', 'Med venue', 'usd', 'slow'],
+  ['vol_top_share', 'Top venue', 'pct', 'slow'],
+  ['our_vol_share', 'Ours', 'pct', 'slow'],
+  ['our_share_max_leg', 'Ours, worst leg', 'pct', 'slow'],
+  ['our_oi_share', 'Our OI', 'pct', 'slow'],
   ['c_flow', 'Flow', 'n0'], ['c_structure', 'Struct', 'n0'], ['c_carry', 'Carry', 'n0'],
   ['c_friction', 'Frict', 'n0'],
   // fast + directional first: these can actually fall. vol_trend cannot (see method).
@@ -746,12 +773,36 @@ the extent the screened set is.</p>
                    (pandas: x.rank(pct=True, ascending=asc, na_option="bottom") * 100)</pre>
 
 <h3>1. Components</h3>
-<p><b>Flow</b> — is there earnable two-way volume, and is it there every day?
-Trade count is Binance-only (no other venue publishes it via REST), so it is a proxy
-tagged with its source, never imputed to the other four.</p>
-<pre>c_flow = [ pct(log10(max(vol_usd_med30, 1)))
-         + pct(days_above_5m)
-         + pct(log10(max(trades_med30, 1))) ] / 3</pre>
+<p><b>Flow</b> — is there earnable two-way volume, is it there every day, and is it
+there <i>away from the leader</i>?</p>
+<pre>c_flow = [ pct(log10(max(${P('flow_use_7d') ? 'adv7_cal' : 'adv30_cal'}, 1)))
+         + pct(persist_cal)
+         + pct(log10(max(${P('flow_venue_depth') ? 'vol_venue_med' : 'trades_med30'}, 1))) ] / 3${
+  P('flow_conc_penalty') > 0 ? `
+         × (1 − ${(+P('flow_conc_penalty')).toFixed(2)} × clip((hhi − ${(+P('flow_conc_free')).toFixed(2)}) / ${(1 - P('flow_conc_free')).toFixed(2)}, 0, 1))` : ''}</pre>
+<p><b>Level window.</b> Currently the
+<b>${P('flow_use_7d') ? '7-day' : '30-day'}</b> median. A 30-day level is a
+month-old view of a book you quote today, and a pump holds it up for the whole
+month — RATS on 2026-08-23 read a $9.95M 30d median on a $2.37M pre-pump baseline.
+The ADV <i>gate</i> still reads 30d on purpose: a floor should be slow, a ranking
+should be current.</p>
+<p><b>Depth.</b> ${P('flow_venue_depth')
+  ? 'The <span class="mono">median venue\'s</span> daily volume. An asset doing $16M '
+    + 'with 82% on one venue has a median venue near $1M, and that is what quoting it '
+    + 'actually feels like; summed volume cannot tell that from $16M spread evenly.'
+  : '<span class="mono">trades/day</span>, which <b>only Binance publishes</b> '
+    + '(17,323 of 17,323 BIN rows carry it, zero on OKX/BGT/GAT/KCN). As a third of '
+    + 'the flow score that rewards Binance concentration — the opposite of the intent.'}</p>
+<p><b>Weekend drag${P('calendar_adjust') ? '' : ' — currently OFF'}.</b> Every
+<span class="mono">_cal</span> input above is the <i>better</i> of the all-days and
+the weekday-only reading, so a weekend can help an asset and never penalise it.
+Weekend volume as a share of weekday, measured over the 30d panel: <b>equity 0.11,
+commodity 0.20, RWA 0.22, crypto 0.96</b> — so any window containing a Saturday marks
+RWA down 4–9× for the calendar alone. It matters most in the <i>gates</i> and the
+off-peak decay rule, not in these percentile ranks: on a log scale a 1.17× lift
+barely moves a rank, but it moves an absolute threshold. With the off-peak rule at
+0.25 on a Sunday, the adjustment is the difference between 40 assets flagged as
+decaying and 7 — COIN reads 0.219 raw against 1.000 weekday-clean.</p>
 <p><b>Structure</b> — how many places can we quote and hedge, and is the flow spread
 across them? <span class="mono">venue_hhi</span> is the Herfindahl index of each
 venue's share of 24h volume, so <span class="mono">1 − hhi</span> rewards dispersion:
