@@ -151,6 +151,11 @@ CREATE TABLE IF NOT EXISTS {DB}.screen_runs
     lane            LowCardinality(String),
     verdict         LowCardinality(String),
     traded          UInt8,
+    -- active | dropped | never. `traded` is (traded_state = 'active'); the third
+    -- state exists because "we took this off" is not the same as "we never had it",
+    -- and collapsing them put already-dropped assets back on the drop list.
+    traded_state    LowCardinality(String),
+    dropped_on      Nullable(Date),
     composite       Float64,
     add_bar         Float64,
     c_flow          Float64,
@@ -358,7 +363,12 @@ CREATE TABLE IF NOT EXISTS {DB}.internal_map
     asset_key       LowCardinality(String),
     asset_class     LowCardinality(String),
     match_rule      LowCardinality(String),
-    fills           UInt64,
+    -- 1 = present in the latest publish of a LIVE strat server. A server that
+    -- stopped publishing (hk, 2026-08-03) is not evidence of anything current.
+    in_config       UInt8,
+    fills           UInt64,             -- last 10 days
+    fills_prev      UInt64,             -- last 90 days
+    dropped_on      Nullable(Date),     -- last config date, if no longer in it
     first_day       Nullable(Date),
     last_day        Nullable(Date)
 )

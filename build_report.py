@@ -247,12 +247,23 @@ def score(m: pd.DataFrame, p: dict | None = None) -> pd.DataFrame:
     thin = (d["n_venues_liq"] < p["hard_venue_min"]) if p["hard_venue_min"] else False
     d["thin_venues"] = thin if isinstance(thin, pd.Series) else pd.Series(
         False, index=d.index)
-    d.loc[d.traded & ((d.n_fail >= nf) | d.decaying | d["thin_venues"]),
-          "verdict"] = "drop"
-    d.loc[d.traded & (d.n_fail < nf) & ~d.decaying & ~d["thin_venues"],
-          "verdict"] = "keep"
-    d.loc[(~d.traded) & (d.n_fail == 0) & (d.composite >= bar), "verdict"] = "add"
-    d.loc[(~d.traded) & ((d.n_fail > 0) | (d.composite < bar)), "verdict"] = "watch"
+    # Runs written before traded_state existed only carry the boolean, so infer the
+    # two states it can represent and leave `dropped` to the runs that know about it.
+    if "traded_state" not in d.columns:
+        d["traded_state"] = np.where(d["traded"], "active", "never")
+    d["traded_state"] = d["traded_state"].replace("", np.nan).fillna(
+        pd.Series(np.where(d["traded"], "active", "never"), index=d.index))
+    # `bad` is applied to BOTH cohorts. It used to gate only the assets we hold,
+    # which let a decaying or single-venue candidate be recommended as an ADD on the
+    # composite alone - the same evidence that would have forced a drop had we been
+    # on it. A gate that only fires in one direction is not a gate.
+    bad = d.decaying | d["thin_venues"]
+    d.loc[d.traded & ((d.n_fail >= nf) | bad), "verdict"] = "drop"
+    d.loc[d.traded & (d.n_fail < nf) & ~bad, "verdict"] = "keep"
+    d.loc[(~d.traded) & (d.n_fail == 0) & ~bad & (d.composite >= bar),
+          "verdict"] = "add"
+    d.loc[(~d.traded) & ((d.n_fail > 0) | bad | (d.composite < bar)),
+          "verdict"] = "watch"
     return d.sort_values("composite", ascending=False)
 
 

@@ -22,7 +22,28 @@ const S = { meta: null, screen: null, venues: null, health: null, params: {},
 const VORDER = ['drop', 'add', 'watch', 'keep'];
 // Does this row survive a traded / not-traded chip? Shared by the screen and the
 // summary so the two tabs can never disagree about what "we trade it" means.
-const tradedOk = (r, f) => f === 'all' || (f === 'ours' ? !!r.traded : !r.traded);
+const rowState = r => r.traded_state || (r.traded ? 'active' : 'never');
+const tradedOk = (r, f) => f === 'all' ? true
+  : f === 'ours' ? !!r.traded
+  : f === 'prev' ? rowState(r) === 'dropped'
+  : !r.traded;
+
+/* Our relationship to an asset has THREE states and the screen used to carry two.
+   'dropped' is an asset we took off the config: not ours to hold, and not a fresh
+   candidate either. UB was scored as ours for ten days after we came off it and
+   duly appeared on the drop list - a recommendation we had already acted on. */
+const bookState = a => (S.bookState && S.bookState[a]) || 'never';
+const BOOK_LABEL = { active: 'we trade it', dropped: 'previously traded',
+                     never: "we don't trade it" };
+function bookBadge(a) {
+  const st = bookState(a);
+  if (st === 'active') return '<span class="pill">we trade it</span>';
+  if (st !== 'dropped') return '';
+  const d = S.bookDropped && S.bookDropped[a];
+  const ago = d ? Math.round((Date.now() - Date.parse(d)) / 864e5) : null;
+  return '<span class="pill" style="color:var(--drop)">dropped'
+    + (d ? ` ${d}${ago != null && ago >= 0 ? ` (${ago}d ago)` : ''}` : '') + '</span>';
+}
 
 const VCOL = { keep: 'var(--keep)', add: 'var(--add)', watch: 'var(--watch)', drop: 'var(--drop)' };
 const pct1 = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
@@ -262,6 +283,7 @@ function drawMoved() {
 const SCREEN_COLS = [
   ['asset_key', 'Asset', 'k'], ['verdict', 'Verdict', 'v'], ['lane', 'Lane', 't'],
   ['asset_class', 'Class', 't'], ['traded', 'We trade', 'b'],
+  ['traded_state', 'Book', 't'], ['dropped_on', 'Dropped', 't'],
   ['composite', 'Composite', 'n1'], ['add_bar', 'Bar', 'n1'],
   ['vol_venue_med', 'Med venue', 'usd', 'slow'],
   ['vol_top_share', 'Top venue', 'pct', 'slow'],
@@ -458,7 +480,8 @@ function drawAssets() {
   const rows = S.screen.rows.filter(r =>
     (!q || r.asset_key.toLowerCase().includes(q)) &&
     (!cl || r.asset_class === cl) &&
-    (tr === '' || String(r.traded ? 1 : 0) === tr));
+    (tr === '' || (tr === 'prev' ? rowState(r) === 'dropped'
+                                : String(r.traded ? 1 : 0) === tr)));
   $('#assets-sub').textContent = `${rows.length} assets · ${SCREEN_COLS.length} columns`;
   setThruMax(rows);
   renderTable($('#t-assets'), rows, SCREEN_COLS, r => openDetail(r.asset_key), 't-assets');
@@ -492,49 +515,77 @@ function pivot(rows, key, valKey) {
 }
 
 /* Our own footprint in the book, as a time series. Only for assets we quote -
-   for anything else the panel is hidden rather than drawn as two zero lines. */
+   for anything else the panel is hidden rather than drawn as flat zero lines.
+
+   One line PER LEG, not per market type. Blending the legs was actively
+   misleading: being 44% of one thin venue is the finding, and averaging it
+   against four deeper venues turns it into an unremarkable 3%. The asset-level
+   share is still reported, in the subtitle, next to the worst single leg. */
 function drawParticipation() {
   const rows = S.detail.participation || [];
   const row = $('#d-part-row');
   if (!rows.length) { row.style.display = 'none'; return; }
-  row.style.display = '';
   const mkt = $('#d-mkt').value;
   const keep = r => mkt === 'all' ? true
     : mkt === 'spot' ? r.market_type === 'spot' : r.market_type !== 'spot';
   const use = rows.filter(keep);
+  if (!use.length) { row.style.display = 'none'; return; }
+  row.style.display = '';
   const dates = [...new Set(use.map(r => r.date))].sort();
   const idx = Object.fromEntries(dates.map((d, i) => [d, i]));
+  const label = r => r.leg || (r.venue + ' ' + r.symbol);
 
-  // Share, not level: two lines of raw USD would just retrace the volume chart
-  // above. A percentage is the thing that is actually being asked.
+  // Share, not level: lines of raw USD would just retrace the volume chart above.
+  // A percentage is the thing actually being asked.
   const mk = (num, den) => {
-    const s = { perp: Array(dates.length).fill(null), spot: Array(dates.length).fill(null) };
+    const byLeg = new Map();
     for (const r of use) {
-      const k = r.market_type === 'spot' ? 'spot' : 'perp';
       const d = +r[den], n = +r[num];
-      if (d > 0) s[k][idx[r.date]] = (n / d) * 100;
+      if (!(d > 0)) continue;
+      const k = label(r);
+      if (!byLeg.has(k)) byLeg.set(k, Array(dates.length).fill(null));
+      byLeg.get(k)[idx[r.date]] = (n / d) * 100;
     }
-    return Object.entries(s).filter(([, v]) => v.some(x => x != null))
-      .map(([name, values]) => ({ name, values }));
+    // Busiest leg first, so legend order matches which line matters.
+    return [...byLeg.entries()].map(([name, values]) => ({ name, values }))
+      .sort((a, b) => Math.max(...b.values.map(v => v || 0))
+                    - Math.max(...a.values.map(v => v || 0)));
   };
-  const vol = mk('our_vol', 'mkt_vol');
-  const oi = mk('our_oi', 'venue_oi');
   const opt = { height: 210, vfmt: v => fmtNum(v, v >= 10 ? 0 : 2) + '%' };
-  timeSeries($('#d-part-vol'), { dates, series: vol }, opt);
-  timeSeries($('#d-part-oi'), { dates, series: oi }, opt);
+  timeSeries($('#d-part-vol'), { dates, series: mk('our_vol', 'mkt_vol') }, opt);
+  timeSeries($('#d-part-oi'), { dates, series: mk('our_oi', 'venue_oi') }, opt);
 
-  const last = k => {
-    const r = use.filter(x => +x[k[1]] > 0).slice(-1)[0];
-    return r ? (+r[k[0]] / +r[k[1]] * 100) : null;
+  // Asset level = summed numerator over summed denominator, per date. NOT the mean
+  // of the leg shares - that weights a $0.2M venue the same as a $200M one.
+  const roll = (num, den) => {
+    const n = {}, d = {};
+    for (const r of use) {
+      if (!(+r[den] > 0)) continue;
+      n[r.date] = (n[r.date] || 0) + +r[num];
+      d[r.date] = (d[r.date] || 0) + +r[den];
+    }
+    const ds = Object.keys(d).sort();
+    if (!ds.length) return { last: null, peak: null };
+    return { last: n[ds[ds.length - 1]] / d[ds[ds.length - 1]] * 100,
+             peak: Math.max(...ds.map(k => n[k] / d[k] * 100)) };
   };
-  const peak = (num, den) => Math.max(0, ...use.filter(r => +r[den] > 0)
-    .map(r => +r[num] / +r[den] * 100));
-  const fmt = (v, p) => v == null ? '—'
-    : `latest ${fmtNum(v, v >= 10 ? 0 : 2)}% · peak ${fmtNum(p, p >= 10 ? 0 : 2)}%`;
-  $('#d-part-vol-sub').textContent = fmt(last(['our_vol', 'mkt_vol']),
-                                         peak('our_vol', 'mkt_vol'));
-  $('#d-part-oi-sub').textContent = fmt(last(['our_oi', 'venue_oi']),
-                                        peak('our_oi', 'venue_oi'));
+  const worst = (num, den) => {
+    let hi = null, who = '';
+    for (const r of use) {
+      if (!(+r[den] > 0)) continue;
+      const v = +r[num] / +r[den] * 100;
+      if (hi == null || v > hi) { hi = v; who = label(r); }
+    }
+    return hi == null ? '' : ' · worst leg ' + fmtNum(hi, hi >= 10 ? 0 : 2) + '% (' + who + ')';
+  };
+  const sub = (num, den) => {
+    const a = roll(num, den);
+    return a.last == null ? '—'
+      : 'asset ' + fmtNum(a.last, a.last >= 10 ? 0 : 2) + '% now · peak '
+        + fmtNum(a.peak, a.peak >= 10 ? 0 : 2) + '%' + worst(num, den);
+  };
+  $('#d-part-vol-sub').textContent = sub('our_vol', 'mkt_vol');
+  $('#d-part-oi-sub').textContent = sub('our_oi', 'venue_oi');
 }
 
 function drawDetail() {
@@ -559,13 +610,15 @@ function drawDetail() {
     .map(r => ({ ...r, vkey: mkt === 'all'
       ? `${r.venue} ${r.market_type === 'spot' ? 'spot' : 'perp'}` : r.venue }));
   const row = (S.screen && S.screen.rows.find(r => r.asset_key === asset)) || {};
-  $('#d-badges').innerHTML = row.verdict
-    ? `<span class="v-${row.verdict}" style="font-size:15px">${row.verdict}</span>
-       <span class="pill">${row.asset_class || ''}</span>
+  // The book badge comes from meta, not from screen_runs: meta covers all ~2,700
+  // assets and screen_runs only the shortlist, so an unscreened asset we trade
+  // would otherwise render with no badge at all.
+  $('#d-badges').innerHTML = (row.verdict ? `<span class="v-${row.verdict}" style="font-size:15px">${row.verdict}</span>` : '')
+    + `<span class="pill">${row.asset_class || ''}</span>
        <span class="pill">${row.lane || ''}</span>
-       ${row.traded ? '<span class="pill">we trade it</span>' : ''}
+       ${bookBadge(asset)}
        ${row.tick_pinned ? '<span class="pill">tick-pinned</span>' : ''}
-       ${row.decaying ? '<span class="pill" style="color:var(--drop)">decaying</span>' : ''}` : '';
+       ${row.decaying ? '<span class="pill" style="color:var(--drop)">decaying</span>' : ''}`;
   // The median is deliberately robust to a pump, so on a spiking asset the tile and the
   // volume chart can differ by 100-1000x and both be right. Show the latest day next to
   // it so that gap is visible instead of looking like a unit bug.
@@ -633,8 +686,12 @@ function drawDetail() {
   S.thruMax = legs.reduce(
     (m, r) => (r.through && String(r.through).slice(0, 10) > m
       ? String(r.through).slice(0, 10) : m), '');
-  $('#legs-sub').textContent = `${legs.length} instruments · sorted by last 24h`;
-  renderTable($('#t-legs'), legs, [
+  const lq = $('#d-legs-quote').value;
+  const legsF = lq === '' ? legs : legs.filter(r => String(+!!r.we_quote) === lq);
+  $('#legs-sub').textContent = `${legsF.length}`
+    + (legsF.length === legs.length ? '' : ` of ${legs.length}`)
+    + ` instruments · sorted by last 24h`;
+  renderTable($('#t-legs'), legsF, [
     ['venue', 'Venue', 't'], ['market_type', 'Market', 't'],
     ['symbol', 'Native symbol', 't'], ['quote', 'Quote', 't'],
     ['we_quote', 'We quote', 'b'],
@@ -661,6 +718,33 @@ function drawDetail() {
     ['px_close', 'Price', 'n6'],
     ['listed_since', 'Listed', 't'], ['days', 'Days', 'n0'],
   ], null, 't-legs');
+}
+
+/* Every asset, not just the shortlist. Grouped by which store backs it, because
+   "30-day candles" and "9 nightly readings" are not the same thing and the picker
+   should not pretend otherwise. The book filter sits on top of that grouping. */
+function fillAssetPicker() {
+  const want = $('#d-book').value;
+  const cur = $('#d-asset').value;
+  const all = (S.meta.assets || []).filter(a => !want || bookState(a.asset_key) === want);
+  const grp = (label, list) => list.length
+    ? `<optgroup label="${label} (${list.length})">`
+      + list.map(a => `<option>${a}</option>`).join('') + '</optgroup>' : '';
+  const keys = f => all.filter(f).map(a => a.asset_key).sort();
+  $('#d-asset').innerHTML = all.length
+    ? grp('30-day history', keys(a => a.deep))
+      + grp('nightly snapshot only', keys(a => !a.deep))
+    : (want ? '<option value="">— none —</option>'
+            : S.screen.rows.map(r => r.asset_key).sort()
+                .map(a => `<option>${a}</option>`).join(''));
+  // Keep the open asset selected even when it is filtered out, so narrowing the
+  // list does not silently swap the page to a different asset.
+  if (cur && $('#d-asset').value !== cur) {
+    if (![...$('#d-asset').options].some(o => o.value === cur))
+      $('#d-asset').insertAdjacentHTML('afterbegin',
+        `<optgroup label="open"><option>${cur}</option></optgroup>`);
+    $('#d-asset').value = cur;
+  }
 }
 
 /* ===================== venues ===================== */
@@ -1152,19 +1236,15 @@ async function init() {
 
     fillAxisSelects(); buildKnobs();
     await loadScreen();
-    // Every asset, not just the shortlist. Grouped by which store backs it, because
-    // "30-day candles" and "9 nightly readings" are not the same thing and the chart
-    // should not pretend otherwise.
-    const grp = (label, list) => list.length
-      ? `<optgroup label="${label} (${list.length})">`
-        + list.map(a => `<option>${a}</option>`).join('') + '</optgroup>' : '';
-    const all = (S.meta.assets || []).map(a => a.asset_key);
-    const deepA = (S.meta.assets || []).filter(a => a.deep).map(a => a.asset_key).sort();
-    const shalA = (S.meta.assets || []).filter(a => !a.deep).map(a => a.asset_key).sort();
-    $('#d-asset').innerHTML = all.length
-      ? grp('30-day history', deepA) + grp('nightly snapshot only', shalA)
-      : S.screen.rows.map(r => r.asset_key).sort()
-          .map(a => `<option>${a}</option>`).join('');
+    // Which assets are ours, for every asset in the universe rather than just the
+    // ~130 in the shortlist. Read once here so the badge and the picker filter can
+    // never disagree with each other.
+    S.bookState = {}; S.bookDropped = {};
+    for (const a of S.meta.assets || []) {
+      S.bookState[a.asset_key] = a.state || 'never';
+      if (a.dropped_on) S.bookDropped[a.asset_key] = String(a.dropped_on).slice(0, 10);
+    }
+    fillAssetPicker();
     // ?asset=TUT deep-links straight to one asset's detail page
     const deep = qp.get('asset');
     if (deep && S.screen.rows.some(r => r.asset_key === deep)) openDetail(deep);
@@ -1221,6 +1301,8 @@ $('#csv-venues').onclick = () => toCsv($('#t-venues'), 'venues.csv');
 $('#d-asset').onchange = e => openDetail(e.target.value);
 $('#d-days').onchange = () => openDetail($('#d-asset').value);
 $('#d-mkt').onchange = () => { if (S.detail) drawDetail(); };
+$('#d-legs-quote').onchange = () => { if (S.detail) drawDetail(); };
+$('#d-book').onchange = () => fillAssetPicker();
 $('#d-log').onchange = () => { if (S.detail) drawDetail(); };
 $('#run-sql').onclick = runSql;
 $('#new-days').onchange = loadHistory;

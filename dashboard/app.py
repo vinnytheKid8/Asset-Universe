@@ -90,15 +90,27 @@ def meta():
     # Every asset in the universe, not just the shortlist, so Asset detail can reach
     # all of them. `deep` marks the ones with a real 30-day candle panel; the rest
     # are served from the nightly snapshot.
+    # `state` is carried here rather than read off screen_runs because the detail
+    # page reaches all ~2,700 assets and screen_runs only holds the shortlist. An
+    # asset off the config with fills in the window is 'dropped', not 'never'.
+    im_max = f"(SELECT max(run_date) FROM {DB}.internal_map)"
     all_assets = q(f"""
         SELECT v.asset_key AS asset_key, any(v.asset_class) AS asset_class,
                sum(v.vol24h_usd) AS vol24h_usd,
-               max(d.asset_key != '') AS deep
+               max(d.asset_key != '') AS deep,
+               multiIf(max(m.in_config) > 0, 'active',
+                       max(m.fills_prev) > 0, 'dropped', 'never') AS state,
+               max(m.dropped_on) AS dropped_on
         FROM (SELECT asset_key, asset_class, vol24h_usd FROM {DB}.venue_snapshot
               WHERE run_date = (SELECT max(run_date) FROM {DB}.venue_snapshot)
                 AND is_excluded = 0 AND asset_key != '') v
         LEFT JOIN (SELECT DISTINCT asset_key FROM {DB}.instrument_daily
                    WHERE date >= today() - 40) d ON v.asset_key = d.asset_key
+        LEFT JOIN (SELECT asset_key, max(in_config) AS in_config,
+                          max(fills_prev) AS fills_prev, max(dropped_on) AS dropped_on
+                   FROM {DB}.internal_map WHERE run_date = {im_max}
+                     AND asset_key != '' GROUP BY asset_key) m
+               ON v.asset_key = m.asset_key
         GROUP BY v.asset_key ORDER BY vol24h_usd DESC""")
     return {
         "run_dates": runs["run_date"].tolist() if len(runs) else [],
@@ -364,16 +376,31 @@ def _series_from_snapshot(a: str, days: int) -> dict:
 
 
 def _participation_series(a: str, days: int) -> pd.DataFrame:
-    """Our own volume and open interest against the venue's, per day.
+    """Our own volume and open interest against the venue's, per day and PER LEG.
 
     Only meaningful for something we quote; returns empty otherwise, and the UI
     hides the panel rather than drawing two flat zero lines.
+
+    Resolved per (venue, symbol) rather than per market type. Rolling the legs up
+    into "perp" and "spot" averaged our share across venues, which is the one thing
+    it must not do: the whole question is whether we ARE the book on some venue, and
+    a 44% share on one thin venue disappears into a 3% blended line.
 
     Notional is price x qty x contract_mult and INVERSE legs are excluded - their qty
     is already USD, so the same formula overstated OKX BTC-USD-SWAP by the price
     ($1.04 TRILLION over 7 days). Position is session + outside - invested, valued at
     that day's close. Spot carries no OI, so our_oi is perp-only by construction.
+
+    The exec scan is bounded by the first day we actually have market data for this
+    asset, not by `days`. They diverge once the range selector offers "everything":
+    dop_exec_record holds 40M rows back to February, and days outside the charted
+    window contribute nothing but scan time.
     """
+    d0 = q(f"""SELECT min(date) AS d0 FROM {DB}.instrument_daily
+               WHERE asset_key = '{a}' AND date >= today() - {int(days)}""")
+    if d0.empty or pd.isna(d0["d0"].iloc[0]):
+        return pd.DataFrame()
+    since = pd.to_datetime(d0["d0"].iloc[0]).date().isoformat()
     return q(f"""
     WITH nm AS (SELECT symbol_id,
                  argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
@@ -386,18 +413,36 @@ def _participation_series(a: str, days: int) -> pd.DataFrame:
     ref AS (SELECT venue, symbol, kind, argMax(contract_mult, ingest_ts) AS mult,
                    argMax(inverse, ingest_ts) AS inv
             FROM {DB}.instrument_ref GROUP BY venue, symbol, kind),
+    -- This asset's symbol_ids, so the exec dedup below groups over ~10 series
+    -- instead of the whole 40M-row table.
+    ids AS (SELECT nm.symbol_id AS symbol_id FROM nm
+            INNER JOIN link l ON l.name = nm.name),
+    -- One row per execution. amendment = 1 is a RESTATEMENT of a fill, identical in
+    -- price/qty/side/ors_order_id/seqnum ~800ns later, and summing both overstated
+    -- our 7-day notional by 12.5%. Deduping is not the same as `amendment = 0`:
+    -- 212,203 refs exist ONLY as an amendment. projected = 1 is a hypothetical fill
+    -- - 48 such rows carry $165M, one of them putting 1,179 BTC on KuCoin's BTC-USDC
+    -- spot book and reading our share of it at 1,017%.
+    fills AS (
+      SELECT symbol_id, exec_ref, toDate(min(local_nanos)) AS date,
+             any(price * qty) AS notional
+      FROM strat__tk_alex.dop_exec_record
+      WHERE local_nanos >= toDateTime('{since} 00:00:00') AND projected = 0
+        AND symbol_id IN (SELECT symbol_id FROM ids)
+      GROUP BY symbol_id, exec_ref),
     ourvol AS (
-      SELECT toDate(e.local_nanos) AS date, l.venue AS venue, l.symbol AS symbol,
-             l.mt AS mt, sum(e.price * e.qty) * any(r.mult) AS our_vol,
+      SELECT f.date AS date, l.venue AS venue, l.symbol AS symbol,
+             l.mt AS mt, sum(f.notional) * any(r.mult) AS our_vol,
              count() AS our_fills
-      FROM strat__tk_alex.dop_exec_record e
-      INNER JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
+      FROM fills f
+      INNER JOIN nm ON CAST(f.symbol_id AS UInt64) = nm.symbol_id
       INNER JOIN link l ON l.name = nm.name
       INNER JOIN ref r ON r.venue = l.venue AND r.symbol = l.symbol AND r.kind = l.kind
-      WHERE e.local_nanos >= now() - INTERVAL {int(days)} DAY AND r.inv = 0
+      WHERE r.inv = 0
       GROUP BY date, venue, symbol, mt),
     ourpos AS (
       SELECT toDate(p.local_nanos) AS date, l.venue AS venue, l.symbol AS symbol,
+             l.mt AS mt,
              abs(argMax(p.session_position + p.outside_position
                         - p.invested_position, p.local_nanos))
              * any(r.mult) AS pos_units
@@ -405,7 +450,7 @@ def _participation_series(a: str, days: int) -> pd.DataFrame:
       INNER JOIN nm ON CAST(p.symbol_id AS UInt64) = nm.symbol_id
       INNER JOIN link l ON l.name = nm.name AND l.mt = 'linear_perp'
       INNER JOIN ref r ON r.venue = l.venue AND r.symbol = l.symbol AND r.kind = l.kind
-      WHERE p.local_nanos >= now() - INTERVAL {int(days)} DAY AND r.inv = 0
+      WHERE p.local_nanos >= toDateTime('{since} 00:00:00') AND r.inv = 0
         -- Two filters, both load-bearing. positions_record files several series
         -- under one symbol_id, and taking the last row by timestamp mixes them:
         --   kind = 1  the BASE position. kind = 2 is the quote/margin balance,
@@ -419,25 +464,29 @@ def _participation_series(a: str, days: int) -> pd.DataFrame:
         AND p.venue = multiIf(l.venue = 'BIN', 3, l.venue = 'OKX', 10,
                               l.venue = 'BGT', 61, l.venue = 'GAT', 19,
                               l.venue = 'KCN', 18, 0)
-      GROUP BY date, venue, symbol),
+      GROUP BY date, venue, symbol, mt),
     mkt AS (
       SELECT date, venue, symbol, market_type AS mt, sum(vol_usd) AS mkt_vol,
              sum(oi_usd) AS venue_oi, any(px_close) AS px
       FROM {DB}.instrument_daily
-      WHERE asset_key = '{a}' AND date >= today() - {int(days)}
+      WHERE asset_key = '{a}' AND date >= '{since}'
       GROUP BY date, venue, symbol, market_type)
-    SELECT m.date AS date, m.mt AS market_type,
-           sum(m.mkt_vol) AS mkt_vol, sum(m.venue_oi) AS venue_oi,
-           sum(ifNull(v.our_vol, 0)) AS our_vol,
-           sum(ifNull(o.pos_units, 0) * m.px) AS our_oi,
-           sum(ifNull(v.our_fills, 0)) AS our_fills
+    SELECT m.date AS date, m.venue AS venue, m.symbol AS symbol,
+           m.mt AS market_type, concat(m.venue, ' ', m.symbol) AS leg,
+           m.mkt_vol AS mkt_vol, m.venue_oi AS venue_oi,
+           ifNull(v.our_vol, 0) AS our_vol,
+           ifNull(o.pos_units, 0) * m.px AS our_oi,
+           ifNull(v.our_fills, 0) AS our_fills
     FROM mkt m
     LEFT JOIN ourvol v ON v.date = m.date AND v.venue = m.venue
                       AND v.symbol = m.symbol AND v.mt = m.mt
-    LEFT JOIN ourpos o ON o.date = m.date AND o.venue = m.venue AND o.symbol = m.symbol
-    GROUP BY date, market_type
-    HAVING sum(ifNull(v.our_vol, 0)) > 0 OR sum(ifNull(o.pos_units, 0)) > 0
-    ORDER BY date, market_type""")
+    -- mt is in the position join too. BIN files spot and perp under the SAME native
+    -- symbol (BTCUSDT), so without it the spot row picks up the perp position and
+    -- reports an open interest we do not hold on a market that has none.
+    LEFT JOIN ourpos o ON o.date = m.date AND o.venue = m.venue
+                      AND o.symbol = m.symbol AND o.mt = m.mt
+    WHERE ifNull(v.our_vol, 0) > 0 OR ifNull(o.pos_units, 0) > 0
+    ORDER BY date, venue, symbol""")
 
 
 @app.get("/api/series")
@@ -676,9 +725,16 @@ def summary(run_date: str | None = None):
     # "we trade it" from internal_map, not screen_runs.traded: screen_runs only holds
     # the ~130 shortlisted assets, so using it would label all 2,700 others "not
     # traded" when the truth is "not screened".
+    #
+    # in_config, not mere presence: internal_map now also carries the legs we have
+    # taken OFF the config, which is the point of it. The OR clause is a migration
+    # guard - the column is 0 on every row written before it existed, and without it
+    # a box that has not re-run the pipeline yet would report that we trade nothing.
+    im_max = f"(SELECT max(run_date) FROM {DB}.internal_map)"
     ours = (f"(SELECT DISTINCT asset_key FROM {DB}.internal_map "
-            f"WHERE run_date = (SELECT max(run_date) FROM {DB}.internal_map) "
-            f"AND asset_key != '')")
+            f"WHERE run_date = {im_max} AND asset_key != '' "
+            f"AND (in_config = 1 OR (SELECT max(in_config) FROM {DB}.internal_map "
+            f"WHERE run_date = {im_max}) = 0))")
 
     by_market = q(f"""
         SELECT kind, count() AS instruments, uniqExact(asset_key) AS assets,

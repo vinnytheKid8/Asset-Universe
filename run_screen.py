@@ -48,25 +48,67 @@ def ch(sql: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(r.text), sep="\t")
 
 
-def traded_instruments(days: int = 10) -> pd.DataFrame:
+def internal_instruments(fill_days: int = 10, prev_days: int = 90,
+                         stale_days: int = 3) -> pd.DataFrame:
+    """Every instrument in our internal config, with whether it is CURRENT.
+
+    Two facts get conflated if you are not careful, and they are not the same thing:
+
+      * we filled it in the last N days  -> we *were* trading it
+      * it is in the latest symbols_record publish -> it is in the config NOW
+
+    UB is the case that exposed the difference: dropped from the config 2026-08-20,
+    last fill 2026-08-21. Keying `traded` off fills alone held it in the traded
+    cohort for ten more days, which put an asset we had ALREADY dropped back on the
+    drop list - the screen recommending a decision we had made a week earlier. 47
+    legs were in that state on 2026-08-26.
+
+    A server whose newest publish trails the newest publish across all servers by
+    more than `stale_days` is decommissioned, and nothing on it is current. hk
+    stopped publishing 2026-08-03 when OKX moved to tk; without this rule all 82 of
+    its instruments read "in config" forever, because they are trivially present in
+    hk's own last publish.
+    """
     frames = []
-    for db in ("strat__tk_alex", "strat__hk_alex"):
+    for server, db in (("tk", "strat__tk_alex"), ("hk", "strat__hk_alex")):
         frames.append(ch(f"""
-        WITH nm AS (SELECT symbol_id,
-                     argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
-                    FROM {db}.symbols_record GROUP BY symbol_id)
-        SELECT nm.name AS name, count() AS fills,
-               min(toDate(e.local_nanos)) AS first_day,
-               max(toDate(e.local_nanos)) AS last_day
-        FROM {db}.dop_exec_record e
-        LEFT JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
-        WHERE e.local_nanos >= now() - INTERVAL {days} DAY
-        GROUP BY name"""))
-    t = pd.concat(frames)
-    t = t.groupby("name", as_index=False).agg(fills=("fills", "sum"),
-                                             first_day=("first_day", "min"),
-                                             last_day=("last_day", "max"))
-    return t[t["name"].str.match(r"^[A-Z]{3}-(S|P|IP|F|IF)-")].copy()
+        WITH s AS (SELECT symbol_id,
+                    argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name,
+                    max(toDate(local_nanos)) AS last_seen
+                   FROM {db}.symbols_record GROUP BY symbol_id),
+        f AS (SELECT CAST(symbol_id AS UInt64) AS symbol_id,
+                     countIf(local_nanos >= now() - INTERVAL {int(fill_days)} DAY)
+                         AS fills,
+                     count() AS fills_prev,
+                     min(toDate(local_nanos)) AS first_day,
+                     max(toDate(local_nanos)) AS last_day
+              FROM {db}.dop_exec_record
+              WHERE local_nanos >= now() - INTERVAL {int(prev_days)} DAY
+                -- a projected exec is a hypothetical fill; it is not evidence that
+                -- we ever quoted the thing, and this gates the dropped cohort
+                AND projected = 0
+              GROUP BY symbol_id)
+        SELECT s.name AS name, s.last_seen AS cfg_last_seen,
+               (SELECT max(toDate(local_nanos)) FROM {db}.symbols_record) AS cfg_date,
+               ifNull(f.fills, 0) AS fills, ifNull(f.fills_prev, 0) AS fills_prev,
+               f.first_day AS first_day, f.last_day AS last_day
+        FROM s LEFT JOIN f ON s.symbol_id = f.symbol_id
+        WHERE match(s.name, '^[A-Z]{{3}}-(S|P|IP|F|IF)-')"""))
+    t = pd.concat(frames, ignore_index=True)
+    for c in ("cfg_last_seen", "cfg_date", "first_day", "last_day"):
+        t[c] = pd.to_datetime(t[c], errors="coerce")
+    newest = t["cfg_date"].max()
+    live_server = t["cfg_date"] >= newest - pd.Timedelta(days=stale_days)
+    t["in_config"] = (live_server & (t["cfg_last_seen"] >= t["cfg_date"])).astype(int)
+    # One name can exist on both servers; it is current if ANY live server carries it.
+    g = t.groupby("name", as_index=False).agg(
+        in_config=("in_config", "max"), fills=("fills", "sum"),
+        fills_prev=("fills_prev", "sum"), first_day=("first_day", "min"),
+        last_day=("last_day", "max"), cfg_last_seen=("cfg_last_seen", "max"))
+    # Dates the config drop, so the UI can say "dropped 6d ago" rather than just
+    # "not traded". Only meaningful for something no longer in the config.
+    g["dropped_on"] = g["cfg_last_seen"].where(g["in_config"] == 0)
+    return g.drop(columns=["cfg_last_seen"])
 
 
 def our_participation(mp: pd.DataFrame, spec: pd.DataFrame,
@@ -84,17 +126,39 @@ def our_participation(mp: pd.DataFrame, spec: pd.DataFrame,
     the internal name carries no native symbol. INVERSE contracts are excluded: their
     qty is already denominated in USD, so the same formula overstates them by the
     price - OKX BTC-USD-SWAP read $1.04 TRILLION over 7 days before they were cut.
+
+    Two filters on the exec stream, both measured 2026-08-26:
+
+      projected = 0   A projected exec is a hypothetical fill, not one that happened.
+                      Only 48 of them carry liq_indicator = UNKNOWN, but between them
+                      they hold $165M: one row put 1,179 BTC on KuCoin's BTC-USDC
+                      SPOT book (a perp-sized contract count on a book that trades
+                      ~$300k/day) and read our share of it at 1,017%.
+
+      one row per     amendment = 1 is a RESTATEMENT of an exec, not another fill.
+      (symbol_id,     The pair is identical in price, qty, side, ors_order_id and
+       exec_ref)      seqnum, ~800ns apart, and in 99,153 of 99,153 duplicate pairs
+                      the qty matches exactly. Summing both overstated our 7-day
+                      notional by 12.5% ($592.0B -> $526.3B).
+                      Deduping is not the same as `amendment = 0`: 212,203 refs exist
+                      ONLY as an amendment, and filtering the flag drops those real
+                      fills. Group and take one, do not filter.
     """
     f = ch(f"""
     WITH nm AS (SELECT symbol_id,
                  argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
                 FROM strat__tk_alex.symbols_record GROUP BY symbol_id),
+    fills AS (
+        SELECT symbol_id, exec_ref, any(price * qty) AS notional,
+               max(local_nanos) AS ts, anyLast(price) AS px
+        FROM strat__tk_alex.dop_exec_record
+        WHERE local_nanos >= now() - INTERVAL {int(days)} DAY AND projected = 0
+        GROUP BY symbol_id, exec_ref),
     ex AS (
-        SELECT nm.name AS name, sum(e.price * e.qty) AS raw_notional,
-               count() AS our_fills, argMax(e.price, e.local_nanos) AS last_px
-        FROM strat__tk_alex.dop_exec_record e
-        LEFT JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
-        WHERE e.local_nanos >= now() - INTERVAL {int(days)} DAY
+        SELECT nm.name AS name, sum(f.notional) AS raw_notional,
+               count() AS our_fills, argMax(f.px, f.ts) AS last_px
+        FROM fills f
+        LEFT JOIN nm ON CAST(f.symbol_id AS UInt64) = nm.symbol_id
         GROUP BY nm.name),
     po AS (
         -- our position = session + outside - invested (confirmed 2026-08-24).
@@ -633,11 +697,13 @@ def main():
           f"{spec.is_excluded.sum()} excluded")
 
     print("== 2. internal symbology mapping ==")
-    trd = traded_instruments()
+    trd = internal_instruments()
     mp = map_internal(parse_internal_names(trd["name"]), spec).merge(trd, on="name")
     emit(mp, "internal_map")
     n_ok = (mp.match_rule != "UNMATCHED").sum()
+    n_cfg = int(mp["in_config"].sum())
     print(f"   {n_ok}/{len(mp)} internal instruments mapped; "
+          f"{n_cfg} in the current config, {len(mp) - n_cfg} dropped from it; "
           f"rules={mp.match_rule.value_counts().to_dict()}")
 
     print("== 3. venue-wide snapshot ==")
@@ -650,12 +716,26 @@ def main():
     emit(dup, "dup_tickers")
     print(f"   {len(dup)} possible duplicate-ticker pairs")
 
-    traded_assets = set(mp["asset_key"].dropna())
+    # THREE cohorts, not two. `traded` means the config carries it today; an asset we
+    # took off can still be scored, but it must not be scored as though we were on it.
+    keyed = mp[mp["asset_key"].notna() & (mp["asset_key"] != "")]
+    traded_assets = set(keyed.loc[keyed["in_config"] == 1, "asset_key"])
+    # "We used to trade it": off the config, but with real fills inside the lookback.
+    # Config presence alone is too loose - it also catches names we wired up and never
+    # quoted, which are candidates, not retirements.
+    dropped_assets = set(keyed.loc[(keyed["in_config"] == 0)
+                                   & (keyed["fills_prev"] > 0), "asset_key"]) \
+        - traded_assets
+    dropped_on = (keyed[keyed["asset_key"].isin(dropped_assets)]
+                  .groupby("asset_key")["dropped_on"].max())
+    # Deep-fetched together: something we just came off is exactly what we want a full
+    # candle panel for. Only the `traded` FLAG narrows - the monitoring does not.
     # Not persisted: the shortlist is consumed in this process to pick the deep-fetch
     # targets, and nothing downstream ever read data/shortlist.parquet.
-    sl = build_shortlist(snap, traded_assets, top_n=a.top)
-    print(f"   shortlist {len(sl)} assets "
-          f"({int(sl.traded.sum())} traded / {int((~sl.traded).sum())} candidates)")
+    sl = build_shortlist(snap, traded_assets | dropped_assets, top_n=a.top)
+    print(f"   shortlist {len(sl)} assets ({len(traded_assets)} traded / "
+          f"{len(dropped_assets)} previously traded / "
+          f"{len(sl) - len(traded_assets | dropped_assets)} candidates)")
 
     if a.no_deep:
         return
@@ -716,6 +796,11 @@ def main():
               f"${part.our_notional.sum()/1e6:,.0f}M over 7d")
     m = asset_metrics(deep, snap, spec, part=part)
     m["traded"] = m["asset_key"].isin(traded_assets)
+    m["traded_state"] = np.where(m["asset_key"].isin(traded_assets), "active",
+                        np.where(m["asset_key"].isin(dropped_assets), "dropped",
+                                 "never"))
+    m["dropped_on"] = m["asset_key"].map(dropped_on)
+    print(f"   cohorts: {pd.Series(m['traded_state']).value_counts().to_dict()}")
     emit(m, "asset_metrics")
     vm = venue_metrics(deep, snap, spec, mp)
     emit(vm, "venue_metrics")
