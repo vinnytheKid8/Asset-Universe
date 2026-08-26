@@ -491,6 +491,52 @@ function pivot(rows, key, valKey) {
   return { dates, series };
 }
 
+/* Our own footprint in the book, as a time series. Only for assets we quote -
+   for anything else the panel is hidden rather than drawn as two zero lines. */
+function drawParticipation() {
+  const rows = S.detail.participation || [];
+  const row = $('#d-part-row');
+  if (!rows.length) { row.style.display = 'none'; return; }
+  row.style.display = '';
+  const mkt = $('#d-mkt').value;
+  const keep = r => mkt === 'all' ? true
+    : mkt === 'spot' ? r.market_type === 'spot' : r.market_type !== 'spot';
+  const use = rows.filter(keep);
+  const dates = [...new Set(use.map(r => r.date))].sort();
+  const idx = Object.fromEntries(dates.map((d, i) => [d, i]));
+
+  // Share, not level: two lines of raw USD would just retrace the volume chart
+  // above. A percentage is the thing that is actually being asked.
+  const mk = (num, den) => {
+    const s = { perp: Array(dates.length).fill(null), spot: Array(dates.length).fill(null) };
+    for (const r of use) {
+      const k = r.market_type === 'spot' ? 'spot' : 'perp';
+      const d = +r[den], n = +r[num];
+      if (d > 0) s[k][idx[r.date]] = (n / d) * 100;
+    }
+    return Object.entries(s).filter(([, v]) => v.some(x => x != null))
+      .map(([name, values]) => ({ name, values }));
+  };
+  const vol = mk('our_vol', 'mkt_vol');
+  const oi = mk('our_oi', 'venue_oi');
+  const opt = { height: 210, vfmt: v => fmtNum(v, v >= 10 ? 0 : 2) + '%' };
+  timeSeries($('#d-part-vol'), { dates, series: vol }, opt);
+  timeSeries($('#d-part-oi'), { dates, series: oi }, opt);
+
+  const last = k => {
+    const r = use.filter(x => +x[k[1]] > 0).slice(-1)[0];
+    return r ? (+r[k[0]] / +r[k[1]] * 100) : null;
+  };
+  const peak = (num, den) => Math.max(0, ...use.filter(r => +r[den] > 0)
+    .map(r => +r[num] / +r[den] * 100));
+  const fmt = (v, p) => v == null ? '—'
+    : `latest ${fmtNum(v, v >= 10 ? 0 : 2)}% · peak ${fmtNum(p, p >= 10 ? 0 : 2)}%`;
+  $('#d-part-vol-sub').textContent = fmt(last(['our_vol', 'mkt_vol']),
+                                         peak('our_vol', 'mkt_vol'));
+  $('#d-part-oi-sub').textContent = fmt(last(['our_oi', 'venue_oi']),
+                                        peak('our_oi', 'venue_oi'));
+}
+
 function drawDetail() {
   const { asset, total, history, legs } = S.detail;
   const snap = S.detail.source === 'snapshot';
@@ -549,6 +595,7 @@ function drawDetail() {
   // mode draws the venues as plain lines instead.
   const lg = $('#d-log').checked;
   const volOpt = { stack: !lg, ylog: lg, height: 250, yfmt: fmtUsd, vfmt: fmtUsd };
+  drawParticipation();
   timeSeries($('#d-vol'), pivot(by_venue, 'vkey', 'vol_usd'), volOpt);
   timeSeries($('#d-oi'), pivot(by_venue, 'vkey', 'oi_usd'), volOpt);
 

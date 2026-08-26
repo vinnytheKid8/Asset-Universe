@@ -191,6 +191,24 @@ on a linear axis the whole pre-spike history flattens to nothing"><input type="c
     </div>
     <div class="tiles" id="d-tiles"></div>
   </div>
+  <!-- only rendered for something we quote; hidden entirely otherwise -->
+  <div class="row" id="d-part-row" style="display:none">
+    <div class="card">
+      <h2>Our share of volume <small id="d-part-vol-sub"></small></h2>
+      <div class="chartbox" id="d-part-vol"></div>
+      <div class="note">Our traded notional as a share of the venue's reported
+        volume. The screen scores the venue TOTAL, which includes us — on a thin book
+        that is circular, and this is the number that says so.</div>
+    </div>
+    <div class="card">
+      <h2>Our share of open interest <small id="d-part-oi-sub"></small></h2>
+      <div class="chartbox" id="d-part-oi"></div>
+      <div class="note">Position = session + outside − invested, valued at that day's
+        close. Perp only — spot has no OI. Bitget publishes no OI, so its legs are
+        excluded from both sides rather than counted on one.</div>
+    </div>
+  </div>
+
   <div class="row">
     <div class="card"><h2>Volume by venue <small>USD/day, stacked</small></h2>
       <div class="chartbox" id="d-vol"></div></div>

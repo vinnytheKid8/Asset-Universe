@@ -363,6 +363,83 @@ def _series_from_snapshot(a: str, days: int) -> dict:
             "history": jsonable(hist), "legs": jsonable(legs), "source": "snapshot"}
 
 
+def _participation_series(a: str, days: int) -> pd.DataFrame:
+    """Our own volume and open interest against the venue's, per day.
+
+    Only meaningful for something we quote; returns empty otherwise, and the UI
+    hides the panel rather than drawing two flat zero lines.
+
+    Notional is price x qty x contract_mult and INVERSE legs are excluded - their qty
+    is already USD, so the same formula overstated OKX BTC-USD-SWAP by the price
+    ($1.04 TRILLION over 7 days). Position is session + outside - invested, valued at
+    that day's close. Spot carries no OI, so our_oi is perp-only by construction.
+    """
+    return q(f"""
+    WITH nm AS (SELECT symbol_id,
+                 argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
+                FROM strat__tk_alex.symbols_record GROUP BY symbol_id),
+    link AS (SELECT name, venue, symbol, kind,
+                    if(kind = 'spot', 'spot', 'linear_perp') AS mt
+             FROM {DB}.internal_map
+             WHERE run_date = (SELECT max(run_date) FROM {DB}.internal_map)
+               AND asset_key = '{a}' AND match_rule != 'UNMATCHED'),
+    ref AS (SELECT venue, symbol, kind, argMax(contract_mult, ingest_ts) AS mult,
+                   argMax(inverse, ingest_ts) AS inv
+            FROM {DB}.instrument_ref GROUP BY venue, symbol, kind),
+    ourvol AS (
+      SELECT toDate(e.local_nanos) AS date, l.venue AS venue, l.symbol AS symbol,
+             l.mt AS mt, sum(e.price * e.qty) * any(r.mult) AS our_vol,
+             count() AS our_fills
+      FROM strat__tk_alex.dop_exec_record e
+      INNER JOIN nm ON CAST(e.symbol_id AS UInt64) = nm.symbol_id
+      INNER JOIN link l ON l.name = nm.name
+      INNER JOIN ref r ON r.venue = l.venue AND r.symbol = l.symbol AND r.kind = l.kind
+      WHERE e.local_nanos >= now() - INTERVAL {int(days)} DAY AND r.inv = 0
+      GROUP BY date, venue, symbol, mt),
+    ourpos AS (
+      SELECT toDate(p.local_nanos) AS date, l.venue AS venue, l.symbol AS symbol,
+             abs(argMax(p.session_position + p.outside_position
+                        - p.invested_position, p.local_nanos))
+             * any(r.mult) AS pos_units
+      FROM strat__tk_alex.positions_record p
+      INNER JOIN nm ON CAST(p.symbol_id AS UInt64) = nm.symbol_id
+      INNER JOIN link l ON l.name = nm.name AND l.mt = 'linear_perp'
+      INNER JOIN ref r ON r.venue = l.venue AND r.symbol = l.symbol AND r.kind = l.kind
+      WHERE p.local_nanos >= now() - INTERVAL {int(days)} DAY AND r.inv = 0
+        -- Two filters, both load-bearing. positions_record files several series
+        -- under one symbol_id, and taking the last row by timestamp mixes them:
+        --   kind = 1  the BASE position. kind = 2 is the quote/margin balance,
+        --             which is a different unit entirely.
+        --   venue     the venue enum of THIS instrument. Binance perp rows are
+        --             BINANCEUM (3); BINANCESPOT (1) rows also appear under the
+        --             same symbol_id and are the spot balance.
+        -- Without both, BIN-P-BTCUSDT read a median -12.4 BTC position but a max of
+        -- 1,374,682 BTC, and our BTC "OI share" came out at 635%.
+        AND p.kind = 1
+        AND p.venue = multiIf(l.venue = 'BIN', 3, l.venue = 'OKX', 10,
+                              l.venue = 'BGT', 61, l.venue = 'GAT', 19,
+                              l.venue = 'KCN', 18, 0)
+      GROUP BY date, venue, symbol),
+    mkt AS (
+      SELECT date, venue, symbol, market_type AS mt, sum(vol_usd) AS mkt_vol,
+             sum(oi_usd) AS venue_oi, any(px_close) AS px
+      FROM {DB}.instrument_daily
+      WHERE asset_key = '{a}' AND date >= today() - {int(days)}
+      GROUP BY date, venue, symbol, market_type)
+    SELECT m.date AS date, m.mt AS market_type,
+           sum(m.mkt_vol) AS mkt_vol, sum(m.venue_oi) AS venue_oi,
+           sum(ifNull(v.our_vol, 0)) AS our_vol,
+           sum(ifNull(o.pos_units, 0) * m.px) AS our_oi,
+           sum(ifNull(v.our_fills, 0)) AS our_fills
+    FROM mkt m
+    LEFT JOIN ourvol v ON v.date = m.date AND v.venue = m.venue
+                      AND v.symbol = m.symbol AND v.mt = m.mt
+    LEFT JOIN ourpos o ON o.date = m.date AND o.venue = m.venue AND o.symbol = m.symbol
+    GROUP BY date, market_type
+    HAVING sum(ifNull(v.our_vol, 0)) > 0 OR sum(ifNull(o.pos_units, 0)) > 0
+    ORDER BY date, market_type""")
+
+
 @app.get("/api/series")
 def series(asset: str = Query(...), days: int = 400):
     """Per-venue daily series for one asset, plus the asset-level roll-up."""
@@ -391,6 +468,7 @@ def series(asset: str = Query(...), days: int = 400):
         SELECT run_date, verdict, composite, add_bar,
                n_fail, vol_usd_med30, oi_usd_med30, spread_bps_med, tick_bps_med
         FROM {DB}.screen_runs WHERE asset_key = '{a}' ORDER BY run_date""")
+    part = _participation_series(a, days)
     # Leg table leads with what is happening NOW, not the 30d median. vol24h_usd is the
     # rolling 24h from the snapshot taken during the run; the medians are the screen's
     # scoring inputs and are deliberately slow. `through` dates each leg's last daily row
@@ -451,6 +529,7 @@ def series(asset: str = Query(...), days: int = 400):
         legs_src = "snapshot"
     return JSONResponse({"by_venue": jsonable(byvenue), "total": jsonable(total),
                          "history": jsonable(hist), "legs": jsonable(legs),
+                         "participation": jsonable(part),
                          "source": "daily", "legs_source": legs_src})
 
 

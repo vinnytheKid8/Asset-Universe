@@ -107,6 +107,21 @@ def our_participation(mp: pd.DataFrame, spec: pd.DataFrame,
         FROM strat__tk_alex.positions_record p
         LEFT JOIN nm ON CAST(p.symbol_id AS UInt64) = nm.symbol_id
         WHERE p.local_nanos >= now() - INTERVAL 12 HOUR
+          -- positions_record files several series under one symbol_id. kind=1 is the
+          -- BASE position (kind=2 is the quote/margin balance) and `venue` is the
+          -- venue enum of THIS instrument - Binance perp rows are BINANCEUM (3),
+          -- while BINANCESPOT (1) rows appear under the same symbol_id and are the
+          -- spot balance. Without both filters BIN-P-BTCUSDT reads a max position of
+          -- 1,374,682 BTC against a median of -12.4, and BTC's OI share came out at
+          -- 635%.
+          AND p.kind = 1
+          AND p.venue = multiIf(substring(nm.name, 1, 5) = 'BIN-P', 3,
+                                substring(nm.name, 1, 5) = 'BIN-I', 2,
+                                substring(nm.name, 1, 5) = 'BIN-S', 1,
+                                substring(nm.name, 1, 3) = 'OKX', 10,
+                                substring(nm.name, 1, 3) = 'BGT', 61,
+                                substring(nm.name, 1, 3) = 'GAT', 19,
+                                substring(nm.name, 1, 3) = 'KCN', 18, 0)
         GROUP BY nm.name)
     SELECT ex.name AS name, ex.raw_notional AS raw_notional, ex.our_fills AS our_fills,
            ex.last_px AS last_px, ifNull(po.our_pos, 0) AS our_pos
