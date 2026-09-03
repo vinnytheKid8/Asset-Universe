@@ -183,7 +183,12 @@ inside the last 90 days — neither a position to hold nor a fresh candidate">pr
         <option value="dropped">previously traded</option>
         <option value="never">we don't trade it</option>
       </select>
-      <select id="d-asset" style="min-width:190px"></select>
+      <div class="combo" id="d-asset-combo">
+        <input type="search" id="d-asset" autocomplete="off" spellcheck="false"
+               placeholder="search asset…" role="combobox" aria-autocomplete="list"
+               aria-expanded="false" aria-controls="d-asset-list">
+        <div class="combo-pop" id="d-asset-list" role="listbox" hidden></div>
+      </div>
       <select id="d-days" title="how far back the charts reach. The daily panel
 accumulates with every nightly run, so the longer ranges fill in over time —
 they are not empty, they are as long as the history is.">

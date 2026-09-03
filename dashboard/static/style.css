@@ -100,6 +100,35 @@ input[type=text],input[type=search],select{background:var(--surface);color:var(-
 input[type=search]{min-width:210px}
 .chip{border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12px;
   cursor:pointer;color:var(--ink2);user-select:none}
+
+/* ---- asset search combobox (Asset detail) ----
+   Replaces a 2,700-option native <select>, which can only jump to options that
+   start with the last key pressed. This is a real search: substring match over
+   the whole universe, prefix hits first, richest first within a tier. */
+.combo{position:relative;display:inline-block}
+.combo>input[type=search]{min-width:210px}
+.combo-pop{position:absolute;z-index:30;top:calc(100% + 4px);left:0;
+  min-width:290px;max-width:380px;max-height:340px;overflow:auto;
+  background:var(--surface);border:1px solid var(--line);border-radius:9px;
+  box-shadow:0 10px 30px rgba(0,0,0,.20);padding:4px}
+.combo-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;
+  cursor:pointer;font-size:13px;white-space:nowrap}
+/* .hi is the keyboard cursor; hover is the mouse. Both read the same so the two
+   input modes never disagree about which row is about to be picked. */
+.combo-row:hover,.combo-row.hi{background:var(--plane)}
+.combo-row .ca-key{font-weight:640}
+.combo-row .ca-key mark{background:color-mix(in srgb,var(--s4) 42%,transparent);
+  color:inherit;border-radius:2px;padding:0 1px}
+.combo-row .ca-vol{margin-left:auto;color:var(--muted);font-size:11.5px;
+  font-variant-numeric:tabular-nums}
+.combo-tag{font-size:10px;text-transform:uppercase;letter-spacing:.04em;
+  border:1px solid var(--line);border-radius:999px;padding:0 6px;color:var(--ink2)}
+.combo-tag.ours{color:var(--add);border-color:color-mix(in srgb,var(--add) 45%,var(--line))}
+.combo-tag.prev{color:var(--watch);border-color:color-mix(in srgb,var(--watch) 45%,var(--line))}
+.combo-tag.snap{color:var(--muted)}
+.combo-foot{padding:5px 8px;color:var(--muted);font-size:11.5px;
+  border-top:1px solid var(--line);margin-top:2px}
+.combo-empty{padding:12px 8px;color:var(--muted);font-size:12.5px;text-align:center}
 .chip.on{background:var(--s1);border-color:var(--s1);color:#fff}
 .chip.on.keep{background:var(--keep);border-color:var(--keep)}
 .chip.on.add{background:var(--add);border-color:var(--add)}

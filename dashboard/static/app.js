@@ -492,7 +492,7 @@ async function openDetail(asset) {
   if (!asset || S.pending === asset) return;
   S.pending = asset;          // claimed synchronously: S.detail is only set after
   switchView('detail');       // the await, so switchView would re-enter forever
-  $('#d-asset').value = asset;
+  AssetPicker.setActive(asset);
   try {
     const days = $('#d-days').value;
     const d = await api('/api/series', { asset, days });
@@ -720,32 +720,125 @@ function drawDetail() {
   ], null, 't-legs');
 }
 
-/* Every asset, not just the shortlist. Grouped by which store backs it, because
-   "30-day candles" and "9 nightly readings" are not the same thing and the picker
-   should not pretend otherwise. The book filter sits on top of that grouping. */
-function fillAssetPicker() {
-  const want = $('#d-book').value;
-  const cur = $('#d-asset').value;
-  const all = (S.meta.assets || []).filter(a => !want || bookState(a.asset_key) === want);
-  const grp = (label, list) => list.length
-    ? `<optgroup label="${label} (${list.length})">`
-      + list.map(a => `<option>${a}</option>`).join('') + '</optgroup>' : '';
-  const keys = f => all.filter(f).map(a => a.asset_key).sort();
-  $('#d-asset').innerHTML = all.length
-    ? grp('30-day history', keys(a => a.deep))
-      + grp('nightly snapshot only', keys(a => !a.deep))
-    : (want ? '<option value="">— none —</option>'
-            : S.screen.rows.map(r => r.asset_key).sort()
-                .map(a => `<option>${a}</option>`).join(''));
-  // Keep the open asset selected even when it is filtered out, so narrowing the
-  // list does not silently swap the page to a different asset.
-  if (cur && $('#d-asset').value !== cur) {
-    if (![...$('#d-asset').options].some(o => o.value === cur))
-      $('#d-asset').insertAdjacentHTML('afterbegin',
-        `<optgroup label="open"><option>${cur}</option></optgroup>`);
-    $('#d-asset').value = cur;
+/* Asset search box over the WHOLE ~2,700-asset universe, not just the shortlist.
+   A native <select> that big is unusable: it can only jump to options that START
+   with the last key you pressed, so "find TIA" means scrolling. This is a real
+   search - substring match, prefix hits first, richest first within a tier - with
+   arrow-key navigation and click-to-open. The d-book dropdown narrows the pool. */
+const AssetPicker = (() => {
+  const input = $('#d-asset'), pop = $('#d-asset-list');
+  const MAX = 60;                 // rows rendered; the footer counts the rest
+  let matches = [], hi = -1, current = '';
+
+  // Candidates for the current book filter. S.meta.assets already arrives sorted
+  // by 24h volume, so keeping that order gives us "richest first" for free.
+  const pool = () => {
+    const want = $('#d-book').value;
+    return (S.meta.assets || []).filter(a => !want || bookState(a.asset_key) === want);
+  };
+
+  // Two tiers - prefix then substring - each preserving the volume order of the
+  // pool. An exact hit floats to the very top. Empty query = the top of the pool.
+  function rank(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return pool().slice(0, MAX + 1);
+    // Full scan of the pool - ~2,700 indexOf calls is sub-millisecond, and scanning
+    // all of it is what lets a low-volume prefix hit still outrank a high-volume
+    // mid-string one. Truncation happens at render, not here.
+    const exact = [], prefix = [], mid = [];
+    for (const a of pool()) {
+      const k = a.asset_key.toLowerCase(), i = k.indexOf(q);
+      if (i < 0) continue;
+      (k === q ? exact : i === 0 ? prefix : mid).push(a);
+    }
+    return [...exact, ...prefix, ...mid];
   }
-}
+
+  const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  // Bold the matched span so the eye lands on why a row is here.
+  function mark(key, q) {
+    q = q.trim();
+    if (!q) return esc(key);
+    const i = key.toLowerCase().indexOf(q.toLowerCase());
+    if (i < 0) return esc(key);
+    return esc(key.slice(0, i)) + '<mark>' + esc(key.slice(i, i + q.length))
+         + '</mark>' + esc(key.slice(i + q.length));
+  }
+
+  function render() {
+    const q = input.value;
+    const shown = matches.slice(0, MAX);
+    if (!shown.length) {
+      pop.innerHTML = `<div class="combo-empty">no asset matches “${esc(q.trim())}”</div>`;
+      return;
+    }
+    const tag = a => (bookState(a.asset_key) === 'active' ? '<span class="combo-tag ours">ours</span>'
+                    : bookState(a.asset_key) === 'dropped' ? '<span class="combo-tag prev">prev</span>' : '')
+                   + (a.deep ? '<span class="combo-tag">30d</span>'
+                             : '<span class="combo-tag snap">snap</span>');
+    pop.innerHTML = shown.map((a, i) =>
+      `<div class="combo-row${i === hi ? ' hi' : ''}" role="option" data-a="${esc(a.asset_key)}">`
+      + `<span class="ca-key">${mark(a.asset_key, q)}</span>${tag(a)}`
+      + `<span class="ca-vol">${a.vol24h_usd ? fmtUsd(a.vol24h_usd) : ''}</span></div>`).join('')
+      + (matches.length > MAX
+          ? `<div class="combo-foot">${matches.length - MAX} more — keep typing to narrow</div>` : '');
+  }
+
+  function show() {
+    matches = rank(input.value);
+    hi = matches.length ? 0 : -1;
+    render();
+    pop.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+  }
+  function hide() {
+    pop.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+  }
+  // Move the keyboard cursor and keep it inside the scroll viewport.
+  function move(step) {
+    if (pop.hidden) return show();
+    if (!matches.length) return;
+    hi = (hi + step + Math.min(matches.length, MAX)) % Math.min(matches.length, MAX);
+    render();
+    pop.children[hi]?.scrollIntoView({ block: 'nearest' });
+  }
+  function pick(a) {
+    if (!a) return;
+    hide();
+    openDetail(a);              // sets the input text via setActive() below
+  }
+
+  input.addEventListener('input', show);
+  input.addEventListener('focus', () => { input.select(); show(); });
+  // Restore the open asset if the user typed a partial and clicked away.
+  input.addEventListener('blur', () => { hide(); input.value = current; });
+  input.addEventListener('keydown', e => {
+    switch (e.key) {
+      case 'ArrowDown': e.preventDefault(); move(1); break;
+      case 'ArrowUp':   e.preventDefault(); move(-1); break;
+      case 'Enter':     e.preventDefault();
+        pick((matches[hi] || matches[0])?.asset_key); break;
+      case 'Escape':    e.preventDefault(); input.value = current; hide(); input.blur(); break;
+    }
+  });
+  // mousedown, not click: fire before the input's blur so the pick still lands,
+  // and preventDefault so focus never leaves the box mid-click.
+  pop.addEventListener('mousedown', e => {
+    const row = e.target.closest('.combo-row');
+    if (!row) return;
+    e.preventDefault();
+    pick(row.dataset.a);
+  });
+
+  return {
+    // openDetail calls this so the box always shows the asset actually on screen.
+    setActive(asset) { current = asset; input.value = asset; },
+    get current() { return current; },
+    // d-book changed: if the list is open, re-rank against the new pool.
+    refresh() { if (!pop.hidden) show(); },
+  };
+})();
 
 /* ===================== venues ===================== */
 function drawVenues() {
@@ -1244,7 +1337,6 @@ async function init() {
       S.bookState[a.asset_key] = a.state || 'never';
       if (a.dropped_on) S.bookDropped[a.asset_key] = String(a.dropped_on).slice(0, 10);
     }
-    fillAssetPicker();
     // ?asset=TUT deep-links straight to one asset's detail page
     const deep = qp.get('asset');
     if (deep && S.screen.rows.some(r => r.asset_key === deep)) openDetail(deep);
@@ -1298,11 +1390,12 @@ $('#csv-assets').onclick = () => toCsv($('#t-assets'), 'assets.csv');
 ['#q-venues', '#f-venue', '#f-quote'].forEach(s => $(s).oninput = drawVenues);
 $('#f-mkt').onchange = e => { S.mktFilter = e.target.value; drawVenues(); };
 $('#csv-venues').onclick = () => toCsv($('#t-venues'), 'venues.csv');
-$('#d-asset').onchange = e => openDetail(e.target.value);
-$('#d-days').onchange = () => openDetail($('#d-asset').value);
+// #d-asset is now a search box (see AssetPicker); selection happens on click/Enter
+// inside it, not via a change event, so nothing is wired here.
+$('#d-days').onchange = () => openDetail(AssetPicker.current);
 $('#d-mkt').onchange = () => { if (S.detail) drawDetail(); };
 $('#d-legs-quote').onchange = () => { if (S.detail) drawDetail(); };
-$('#d-book').onchange = () => fillAssetPicker();
+$('#d-book').onchange = () => AssetPicker.refresh();
 $('#d-log').onchange = () => { if (S.detail) drawDetail(); };
 $('#run-sql').onclick = runSql;
 $('#new-days').onchange = loadHistory;
