@@ -759,6 +759,23 @@ def summary(run_date: str | None = None):
         FROM {DB}.venue_snapshot WHERE {live}
         GROUP BY asset_class ORDER BY vol24h DESC""")
 
+    # Venue-wide totals over time: the same snapshot the tiles read, but every
+    # run_date instead of just today. ours/not comes from applying TODAY's config
+    # across history - a leg we quote now is counted ours on every past day too, so
+    # the split is "what our current book covers", not a point-in-time replay.
+    # Ends at the selected run (so the series tracks the run-date picker) and holds
+    # ~6 months so the panel stays bounded as the table grows.
+    ts_hi = f"toDate('{run_date}')" if run_date else vs_max
+    totals_ts = q(f"""
+        SELECT run_date,
+               sum(vol24h_usd) AS vol24h,
+               sumIf(vol24h_usd, asset_key IN {ours}) AS vol24h_ours,
+               sum(oi_usd) AS oi,
+               sumIf(oi_usd, asset_key IN {ours}) AS oi_ours
+        FROM {DB}.venue_snapshot
+        WHERE is_excluded = 0 AND run_date <= {ts_hi} AND run_date > {ts_hi} - 180
+        GROUP BY run_date ORDER BY run_date""")
+
     # Funding: only perps have it, and the spread across venues is the tradeable part
     funding = q(f"""
         SELECT asset_key, avg(funding_rate) * 100 AS fr_pct,
@@ -790,10 +807,90 @@ def summary(run_date: str | None = None):
         "by_market": jsonable(by_market),
         "by_venue": jsonable(by_venue),
         "by_class": jsonable(by_class),
+        "totals_ts": jsonable(totals_ts),
         "funding": jsonable(funding),
         "verdicts": jsonable(verdicts),
         "movers": jsonable(movers),
     }
+
+
+@app.get("/api/vol_ts")
+def vol_ts(run_date: str | None = None, days: int = 180):
+    """Volume over time at (venue, kind, asset_class) grain: the whole market against
+    what WE actually executed. The UI groups, filters and sums these client-side, so
+    the group-by and filter controls respond without a round-trip.
+
+    market — venue_snapshot's 24h reading, one row per instrument per run_date, rolled
+             up to (run_date, venue, kind, asset_class). The same snapshot the tiles
+             read; one point per nightly run.
+    ours   — our executed notional from dop_exec_record: deduped to one row per
+             (symbol_id, exec_ref) with projected = 0, price*qty summed PER SYMBOL and
+             then * that symbol's contract_mult before rolling up (a group spans symbols
+             with different mults, so one shared mult would be wrong), inverse legs
+             dropped (their qty is already USD), mapped to venue/kind/asset_class through
+             internal_map. This is what we traded, not the market's volume in our names -
+             and it is ~1000x smaller, hence its own panel rather than an overlay.
+
+             Legs are mapped by their last internal_map row regardless of in_config, so
+             volume we put through a leg we have since dropped still counts - the exec
+             record is the truth about what we traded. Symbols we cannot map (unmatched)
+             are dropped, as everywhere else.
+
+    The exec scan is bounded to the market window shown: dop_exec_record is 40M rows back
+    to February and days outside the snapshot window are pure scan time.
+    """
+    vs_max = f"(SELECT max(run_date) FROM {DB}.venue_snapshot)"
+    ts_hi = f"toDate('{run_date}')" if run_date else vs_max
+    market = q(f"""
+        SELECT run_date AS date, venue, kind, asset_class, sum(vol24h_usd) AS vol
+        FROM {DB}.venue_snapshot
+        WHERE is_excluded = 0 AND run_date <= {ts_hi} AND run_date > {ts_hi} - {int(days)}
+        GROUP BY run_date, venue, kind, asset_class ORDER BY run_date""")
+    if market.empty:
+        return JSONResponse({"market": [], "ours": []})
+    since = str(pd.to_datetime(market["date"]).min().date())
+    hi = str(pd.to_datetime(market["date"]).max().date())
+    ours = q(f"""
+        WITH nm AS (
+            SELECT symbol_id,
+                   argMax(replaceAll(toString(name),'\\0',''), local_nanos) AS name
+            FROM strat__tk_alex.symbols_record GROUP BY symbol_id),
+        link AS (
+            SELECT name, argMax(venue, run_date) AS venue,
+                   argMax(kind, run_date) AS kind,
+                   argMax(asset_class, run_date) AS asset_class,
+                   argMax(symbol, run_date) AS symbol
+            FROM {DB}.internal_map
+            WHERE asset_key != '' AND match_rule != 'UNMATCHED'
+            GROUP BY name),
+        ref AS (
+            SELECT venue, symbol, kind, argMax(contract_mult, ingest_ts) AS mult,
+                   argMax(inverse, ingest_ts) AS inv
+            FROM {DB}.instrument_ref GROUP BY venue, symbol, kind),
+        ids AS (SELECT nm.symbol_id AS symbol_id FROM nm
+                INNER JOIN link l ON l.name = nm.name),
+        fills AS (
+            SELECT symbol_id, exec_ref, toDate(min(local_nanos)) AS date,
+                   any(price * qty) AS notional
+            FROM strat__tk_alex.dop_exec_record
+            WHERE local_nanos >= toDateTime('{since} 00:00:00')
+              AND local_nanos < toDateTime('{hi} 00:00:00') + INTERVAL 1 DAY
+              AND projected = 0 AND symbol_id IN (SELECT symbol_id FROM ids)
+            GROUP BY symbol_id, exec_ref),
+        ourvol AS (
+            SELECT f.date AS date, l.venue AS venue, l.kind AS kind,
+                   l.asset_class AS asset_class,
+                   sum(f.notional) * any(r.mult) AS vol
+            FROM fills f
+            INNER JOIN nm ON CAST(f.symbol_id AS UInt64) = nm.symbol_id
+            INNER JOIN link l ON l.name = nm.name
+            INNER JOIN ref r ON r.venue = l.venue AND r.symbol = l.symbol
+                            AND r.kind = l.kind
+            WHERE r.inv = 0
+            GROUP BY date, venue, kind, asset_class, l.symbol)
+        SELECT date, venue, kind, asset_class, sum(vol) AS vol
+        FROM ourvol GROUP BY date, venue, kind, asset_class ORDER BY date""")
+    return JSONResponse({"market": jsonable(market), "ours": jsonable(ours)})
 
 
 @app.get("/api/query")

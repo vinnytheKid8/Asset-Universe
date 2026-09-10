@@ -43,6 +43,58 @@
     <div class="tiles" id="sum-tiles"></div>
   </div>
 
+  <div class="card">
+    <h2>Venue totals over time <small id="sum-ts-sub"></small></h2>
+    <div class="ctl">
+      <span class="chip on" data-ts="usd">USD</span>
+      <span class="chip" data-ts="pct">% change</span>
+      <span class="note" style="margin:0 0 0 auto">Venue-wide 24h snapshot summed over
+        every instrument, one point per run. % change is rebased to the first day shown.</span>
+    </div>
+    <div class="sum-grid">
+      <div>
+        <h3 class="subh">24h volume <small id="sum-ts-vol-s"></small></h3>
+        <div class="chartbox" id="sum-ts-vol"></div>
+      </div>
+      <div>
+        <h3 class="subh">Open interest <small id="sum-ts-oi-s"></small></h3>
+        <div class="chartbox" id="sum-ts-oi"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Volume breakdown over time <small id="volts-sub"></small></h2>
+    <div class="ctl">
+      <label>group by <select id="volts-group">
+        <option value="">total</option>
+        <option value="venue">exchange</option>
+        <option value="kind">instrument</option>
+        <option value="asset_class">asset class</option>
+      </select></label>
+      <span class="chip on" data-vtm="usd">USD</span>
+      <span class="chip" data-vtm="pct">% change</span>
+      <label title="volume spans orders of magnitude across groups; a linear axis
+flattens the small ones to nothing"><input type="checkbox" id="volts-log"> log</label>
+      <span class="note" style="margin:0 0 0 auto">Market is the venue 24h snapshot;
+        ours is our executed notional — deduped fills, inverse legs excluded. Group-by
+        and the filters below apply to both panels. % change rebases each series to the
+        first day shown.</span>
+    </div>
+    <div class="ctl" id="volts-filters"></div>
+    <div>
+      <h3 class="subh">Market volume <small id="volts-mkt-s"></small></h3>
+      <div class="chartbox" id="volts-mkt"></div>
+    </div>
+    <div style="margin-top:12px">
+      <h3 class="subh">Our executed volume <small id="volts-ours-s"></small></h3>
+      <div class="chartbox" id="volts-ours"></div>
+    </div>
+    <div class="note">Our executed notional is a true per-day sum of fills; the market
+      line is a rolling 24h snapshot taken once per run. They share a day axis but not an
+      identical window, so read the overlay as regime, not a same-instant ratio.</div>
+  </div>
+
   <div class="sum-grid">
     <div class="card">
       <h2>Volume by venue &amp; market <small>24h, USD</small></h2>

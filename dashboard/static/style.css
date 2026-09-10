@@ -264,9 +264,23 @@ textarea{width:100%;background:var(--surface);color:var(--ink);border:1px solid 
   gap:14px;align-items:start}
 .sum-grid>*{min-width:0}
 
+/* Sub-heading for a panel that lives inside another card (e.g. the two charts under
+   "Venue totals over time"), styled like a card h2 but a notch quieter. */
+.subh{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
+  margin:0 0 6px}
+.subh small{text-transform:none;letter-spacing:0;color:var(--ink2);font-weight:400;
+  font-variant-numeric:tabular-nums;margin-left:8px}
+.subh b.up{color:var(--good)} .subh b.dn{color:var(--crit)}
+
 /* A separator between two chip groups that filter on different axes - without it
    "drop | all" reads as one row of alternatives rather than two questions. */
 .ctl .sep{width:1px;align-self:stretch;background:var(--line);margin:0 4px}
+
+/* Filter chip groups on the volume-breakdown card: one labelled row of multi-select
+   chips per axis (exchange / instrument / class), kept together and spaced apart so
+   the axes don't blur into one long strip of toggles. */
+.fgrp{display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap;margin-right:16px}
+.fdim{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-right:2px}
 
 /* Stat tiles carry a headline number and a subordinate line. Values are tabular so
    a column of them lines up on the decimal. */

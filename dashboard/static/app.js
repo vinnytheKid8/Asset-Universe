@@ -15,7 +15,9 @@ const showErr = e => { $('#err').innerHTML = `<div class="err">${e.message || e}
 const S = { meta: null, screen: null, venues: null, health: null, params: {},
             vfilter: new Set(['keep', 'add', 'watch', 'drop']), movedOnly: false,
             tfilter: 'all', detail: null, pending: null, sort: {}, mktFilter: '',
-            summary: null, sfilter: 'all', logs: null };
+            summary: null, sfilter: 'all', tsmode: 'usd', logs: null,
+            volts: null, voltsGroup: '', voltsMode: 'usd',
+            voltsExcl: { venue: new Set(), kind: new Set(), asset_class: new Set() } };
 
 // Verdicts in decision order - what we are dropping first, what we could add next,
 // then the maybes, then the steady state. Not alphabetical, not by count.
@@ -1191,6 +1193,9 @@ function drawSummary() {
     + t('we quote', `${d.movers.filter(r => r.traded).length}`,
         `${d.by_market.reduce((a, r) => Math.max(a, +r.assets_ours || 0), 0)} assets have a leg somewhere`);
 
+  /* ---- venue totals over time ---- */
+  drawTotalsTs();
+
   /* ---- venue x market ---- */
   const vr = [];
   for (const r of d.by_venue) {
@@ -1252,6 +1257,148 @@ function drawSummary() {
        : S.sfilter === 'ours' ? 'assets we quote' : 'assets we do not quote');
 }
 
+// Rebase a value series to a percent change off its first finite point, so the two
+// panels share a % axis and OI vs volume growth are directly comparable.
+function rebasePct(vals) {
+  const i0 = vals.findIndex(v => v != null && !Number.isNaN(v) && v !== 0);
+  if (i0 < 0) return vals.map(() => null);
+  const b = vals[i0];
+  return vals.map(v => v == null || Number.isNaN(v) ? null : (v / b - 1) * 100);
+}
+function netPct(vals) {
+  const fin = vals.filter(v => v != null && !Number.isNaN(v));
+  return fin.length < 2 || !fin[0] ? null : (fin[fin.length - 1] / fin[0] - 1) * 100;
+}
+
+// Total venue volume and OI across the whole snapshot, one point per run. Same
+// traded/not chip as the rest of the tab (via pick), toggled USD vs % change. The
+// per-panel subtitle always carries the net window % change, so the number the user
+// asked for is on screen in either mode.
+function drawTotalsTs() {
+  const d = S.summary;
+  const rows = d && d.totals_ts;
+  if (!rows || !rows.length) return;
+  const dates = rows.map(r => r.run_date);
+  const pctMode = S.tsmode === 'pct';
+  const pctFmt = v => v == null || Number.isNaN(v) ? '—' : `${v >= 0 ? '+' : ''}${fmtNum(v, 1)}%`;
+
+  const panel = (host, subEl, base, label) => {
+    const raw = rows.map(r => pick(r, base));
+    const net = netPct(raw);
+    const last = raw[raw.length - 1];
+    subEl.innerHTML = `${fmtUsd(last)}`
+      + (net == null ? '' : ` · <b class="${net >= 0 ? 'up' : 'dn'}">${pctFmt(net)}</b>`);
+    timeSeries($(host), { dates, series: [{ name: label, values: pctMode ? rebasePct(raw) : raw }] },
+      { height: 230, yfmt: pctMode ? pctFmt : fmtUsd, vfmt: pctMode ? pctFmt : fmtUsd });
+  };
+  panel('#sum-ts-vol', $('#sum-ts-vol-s'), 'vol24h', '24h volume');
+  panel('#sum-ts-oi', $('#sum-ts-oi-s'), 'oi', 'open interest');
+
+  $('#sum-ts-sub').textContent = `${dates[0]} → ${dates[dates.length - 1]} · `
+    + (S.sfilter === 'all' ? 'whole universe'
+       : S.sfilter === 'ours' ? 'assets we quote' : 'assets we do not quote');
+}
+
+/* ===== volume breakdown over time (interactive: group / filter / overlay) =====
+   Two granular arrays come from /api/vol_ts, one point per (day, venue, kind, class).
+   Everything else - the group-by, the filters, the sums - happens here so the controls
+   are instant. The market and our-executed panels share one date axis (the market's
+   run-date cadence), so they line up vertically and can be read as one picture. */
+const VDIM = [['venue', 'exchange'], ['kind', 'instrument'], ['asset_class', 'class']];
+const voltsLabel = (dim, v) => dim === 'kind' ? (MKT[v] || v) : v;
+
+async function loadVolTs() {
+  try {
+    S.volts = await api('/api/vol_ts', { run_date: $('#run-date').value || null });
+    buildVoltsFilters();
+    drawVolTs();
+  } catch (e) { showErr(e); }
+}
+
+// One chip row per dimension. All chips on = no filter. The excluded values live in
+// S.voltsExcl (not on the elements) so a run-date reload can rebuild the chips without
+// losing the selection, and a redraw never has to read state back off the DOM.
+function buildVoltsFilters() {
+  const d = S.volts; if (!d) return;
+  const all = [...(d.market || []), ...(d.ours || [])];
+  const host = $('#volts-filters'); host.innerHTML = '';
+  for (const [dim, label] of VDIM) {
+    const vals = [...new Set(all.map(r => r[dim]).filter(v => v != null))].sort();
+    if (vals.length < 2) continue;                 // nothing to filter on
+    const grp = document.createElement('span'); grp.className = 'fgrp';
+    grp.innerHTML = `<span class="fdim">${label}</span>`;
+    for (const v of vals) {
+      const c = document.createElement('span');
+      c.className = 'chip' + (S.voltsExcl[dim].has(v) ? '' : ' on');
+      c.textContent = voltsLabel(dim, v);
+      c.onclick = () => {
+        S.voltsExcl[dim].has(v) ? S.voltsExcl[dim].delete(v) : S.voltsExcl[dim].add(v);
+        c.classList.toggle('on');
+        drawVolTs();
+      };
+      grp.appendChild(c);
+    }
+    host.appendChild(grp);
+  }
+}
+
+// Filter by the excluded sets, group by the chosen dim (or one 'total' series), and sum
+// onto the shared date axis. Rows on a date the market axis doesn't have are dropped -
+// the snapshot cadence defines the picture, and our fills fall on those same days.
+function voltsSeries(rows, dates, idx, groupDim) {
+  const ex = S.voltsExcl;
+  const map = {};
+  for (const r of rows) {
+    if (ex.venue.has(r.venue) || ex.kind.has(r.kind) || ex.asset_class.has(r.asset_class)) continue;
+    const i = idx[r.date]; if (i == null) continue;
+    const k = groupDim ? r[groupDim] : 'total';
+    (map[k] || (map[k] = new Array(dates.length).fill(0)))[i] += (+r.vol || 0);
+  }
+  return Object.keys(map).sort()
+    .map(n => ({ name: groupDim ? voltsLabel(groupDim, n) : 'total', values: map[n] }));
+}
+
+function drawVolTs() {
+  const d = S.volts;
+  if (!d || !d.market || !d.market.length) {
+    $('#volts-mkt').innerHTML = '<div class="empty">no data</div>';
+    $('#volts-ours').innerHTML = ''; return;
+  }
+  const dates = [...new Set(d.market.map(r => r.date))].sort();
+  const idx = Object.fromEntries(dates.map((x, i) => [x, i]));
+  const g = S.voltsGroup, pct = S.voltsMode === 'pct', log = $('#volts-log').checked;
+  const pctFmt = v => v == null || Number.isNaN(v) ? '—' : `${v >= 0 ? '+' : ''}${fmtNum(v, 1)}%`;
+
+  const mkt = voltsSeries(d.market, dates, idx, g);
+  const ours = voltsSeries(d.ours || [], dates, idx, g);
+
+  // Unstacked per-date totals, for the subtitles and the participation figure.
+  const tot = ser => dates.map((_, i) => ser.reduce((a, s) => a + (s.values[i] || 0), 0));
+  const mTot = tot(mkt), oTot = tot(ours), last = a => a.length ? a[a.length - 1] : null;
+
+  // Stacking rebased percentages, or a log axis, is meaningless - both force plain
+  // lines. Otherwise a grouped view stacks into an area so the height reads as the sum.
+  const stack = !!g && !pct && !log;
+  const prep = ser => pct ? ser.map(s => ({ name: s.name, values: rebasePct(s.values) })) : ser;
+  const opt = { height: g ? 260 : 220, stack, ylog: log && !pct,
+                yfmt: pct ? pctFmt : fmtUsd, vfmt: pct ? pctFmt : fmtUsd };
+  timeSeries($('#volts-mkt'), { dates, series: prep(mkt) }, opt);
+  timeSeries($('#volts-ours'), { dates, series: prep(ours) }, opt);
+
+  const netM = netPct(mTot), netO = netPct(oTot);
+  $('#volts-mkt-s').innerHTML = fmtUsd(last(mTot))
+    + (netM == null ? '' : ` · <b class="${netM >= 0 ? 'up' : 'dn'}">${pctFmt(netM)}</b>`);
+  const share = last(mTot) ? last(oTot) / last(mTot) * 100 : null;
+  $('#volts-ours-s').innerHTML = fmtUsd(last(oTot))
+    + (netO == null ? '' : ` · <b class="${netO >= 0 ? 'up' : 'dn'}">${pctFmt(netO)}</b>`)
+    + (share != null ? ` · ${fmtNum(share, 2)}% of market` : '');
+
+  const nf = VDIM.reduce((a, [dim]) => a + S.voltsExcl[dim].size, 0);
+  $('#volts-sub').textContent = `${dates[0]} → ${dates[dates.length - 1]}`
+    + (g ? ` · by ${VDIM.find(x => x[0] === g)[1]}` : ' · total')
+    + (nf ? ` · ${nf} filtered out` : '');
+}
+
 /* ===================== logs ===================== */
 const LOGRE = /(WARNING|ERROR|FATAL|Traceback|CRITICAL)/;
 
@@ -1303,7 +1450,10 @@ function switchView(v) {
   if (v === 'history') {
     if (!S.history) loadHistory(); else drawHistory();
   }
-  if (v === 'summary') { if (!S.summary) loadSummary(); else drawSummary(); }
+  if (v === 'summary') {
+    if (!S.summary) loadSummary(); else drawSummary();
+    if (!S.volts) loadVolTs(); else drawVolTs();
+  }
   if (v === 'logs') { if (!S.logs) loadLogs(); else drawLogs(); }
 }
 
@@ -1341,7 +1491,7 @@ async function init() {
     const deep = qp.get('asset');
     if (deep && S.screen.rows.some(r => r.asset_key === deep)) openDetail(deep);
     else if (location.hash) switchView(location.hash.slice(1));
-    else loadSummary();   // summary is the landing tab
+    else { loadSummary(); loadVolTs(); }   // summary is the landing tab
   } catch (e) { showErr(e); }
 }
 
@@ -1353,6 +1503,7 @@ $('#theme').onclick = () => {
        : document.documentElement.removeAttribute('data-theme');
   if (S.screen) { drawScatter(); if (S.detail) drawDetail(); if (S.health) drawHealth(); }
   if (S.summary) drawSummary();
+  if (S.volts) drawVolTs();
 };
 $('#reset').onclick = () => { S.params = {}; buildKnobs(); loadScreen(); };
 $('#copylink').onclick = () => {
@@ -1361,7 +1512,11 @@ $('#copylink').onclick = () => {
   navigator.clipboard.writeText(u.toString());
   $('#copylink').textContent = 'copied'; setTimeout(() => $('#copylink').textContent = 'Link', 1200);
 };
-$('#run-date').onchange = () => { loadScreen(); if (S.summary) loadSummary(); };
+$('#run-date').onchange = () => {
+  loadScreen();
+  if (S.summary) loadSummary();
+  if (S.volts) loadVolTs();
+};
 ['#sx', '#sy', '#sxlog', '#sylog'].forEach(s => $(s).onchange = drawScatter);
 $$('.chip[data-vf]').forEach(c => c.onclick = () => {
   c.classList.toggle('on');
@@ -1378,6 +1533,16 @@ $$('.chip[data-tf]').forEach(c => c.onclick = () => {
 $$('.chip[data-sf]').forEach(c => c.onclick = () => {
   $$('.chip[data-sf]').forEach(o => o.classList.toggle('on', o === c));
   S.sfilter = c.dataset.sf; drawSummary();
+});
+$$('.chip[data-ts]').forEach(c => c.onclick = () => {
+  $$('.chip[data-ts]').forEach(o => o.classList.toggle('on', o === c));
+  S.tsmode = c.dataset.ts; drawTotalsTs();
+});
+$('#volts-group').onchange = e => { S.voltsGroup = e.target.value; drawVolTs(); };
+$('#volts-log').onchange = drawVolTs;
+$$('.chip[data-vtm]').forEach(c => c.onclick = () => {
+  $$('.chip[data-vtm]').forEach(o => o.classList.toggle('on', o === c));
+  S.voltsMode = c.dataset.vtm; drawVolTs();
 });
 $('#log-file').onchange = e => loadLogs(e.target.value);
 $('#log-tail').onchange = () => loadLogs($('#log-file').value);
